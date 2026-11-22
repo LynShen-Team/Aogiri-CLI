@@ -31,7 +31,9 @@
 //!   it is moved to the background first (`background_tasks`) and reports
 //!   back as a task notification. Until the CLI replays the message
 //!   it stays listed, first and `fixed` (it can no longer be taken back).
-//!   Claude Code saves it only as a `queued_command` attachment row.
+//!   Claude Code saves it only as a `queued_command` attachment row. A
+//!   message sent behind a `/model` switch waits the same way until the CLI
+//!   answers the `set_model`, so it runs on the model picked.
 //! - Full access (`bypassPermissions`) is only honored when the CLI starts
 //!   with `--dangerously-skip-permissions`, so switching into or out of it
 //!   restarts the engine on the same conversation.
@@ -867,6 +869,10 @@ pub struct Claude {
     context_window: u64,
     catalog: Vec<Value>,
     pending_model: String,
+    /// `model` is the catalog's default as `list_models` named it: shown,
+    /// but neither confirmed by the CLI (a turn's init, a switch's answer)
+    /// nor asked for, so a restart does not pin it with `--model`.
+    model_guessed: bool,
     model_windows: HashMap<String, u64>,
     /// Synthetic call id → (control request id, the can_use_tool request).
     approvals: HashMap<String, (String, Value)>,
@@ -940,6 +946,7 @@ impl Claude {
             context_window: 0,
             catalog: Vec::new(),
             pending_model: String::new(),
+            model_guessed: false,
             model_windows: HashMap::new(),
             approvals: HashMap::new(),
             approval_seq: 0,
@@ -971,7 +978,9 @@ impl Claude {
 
     /// Where Claude Code keeps this conversation's Workflows and subagents.
     fn session_dir(&self) -> PathBuf {
-        project_dir(&self.config, &self.cwd).join(&self.conversation)
+        conversation_file(&self.config, &self.cwd, &self.conversation)
+            .map(|file| file.with_extension(""))
+            .unwrap_or_else(|| project_dir(&self.config, &self.cwd).join(&self.conversation))
     }
 
     fn control_request(&mut self, request: Value, tag: &str) -> String {
@@ -1155,6 +1164,19 @@ impl Claude {
             "context_limit": 0,
             "state": if self.active_turn { "streaming" } else { "ready" },
         })
+    }
+
+    /// The model `pick` (an alias or an id) names in the CLI's catalog, as
+    /// the id it resolves to; `pick` itself when the catalog lacks it.
+    fn catalog_model(&self, pick: &str) -> String {
+        self.catalog
+            .iter()
+            .find(|m| text(&m["value"]) == pick || text(&m["resolvedModel"]) == pick)
+            .map(|m| match text(&m["resolvedModel"]) {
+                "" => text(&m["value"]).to_string(),
+                resolved => resolved.to_string(),
+            })
+            .unwrap_or_else(|| pick.to_string())
     }
 
     /// `/model` and `/resume` are the desktop's own pickers and `/btw` our
@@ -1438,6 +1460,10 @@ impl Claude {
         self.conversation = text(&frame["session_id"]).to_string();
         let model = text(&frame["model"]).to_string();
         let engine_mode = text(&frame["permissionMode"]).to_string();
+        // The model the CLI runs, as it names it.
+        if !model.is_empty() {
+            self.model_guessed = false;
+        }
         if self.started {
             let mut events = Vec::new();
             if !model.is_empty() && model != self.model {
@@ -1991,6 +2017,27 @@ impl Claude {
         Output::events(events)
     }
 
+    /// A control request answered; a model switch answered (or refused)
+    /// lets the message held for it go.
+    fn on_control_answer(&mut self, frame: &Value) -> Output {
+        let switch = self
+            .pending
+            .get(text(&frame["response"]["request_id"]))
+            .is_some_and(|(subtype, _)| subtype == "set_model");
+        let mut events = self.on_control_response(frame);
+        let mut frames = Vec::new();
+        if switch
+            && self.pending_model.is_empty()
+            && !self.active_turn
+            && self.queued.is_empty()
+            && !self.held.is_empty()
+        {
+            frames.push(self.release(0));
+            events.push(self.queued_event());
+        }
+        Output { events, frames }
+    }
+
     fn on_control_response(&mut self, frame: &Value) -> Vec<Value> {
         let response = &frame["response"];
         let Some((subtype, tag)) = self.pending.remove(text(&response["request_id"])) else {
@@ -2076,6 +2123,15 @@ impl Claude {
                     return vec![self.model_view()];
                 }
                 let mut events = Vec::new();
+                // Started with `--model`: that one runs, not the default.
+                if let Some(pick) = self
+                    .requested_model
+                    .clone()
+                    .filter(|_| self.model.is_empty())
+                {
+                    self.model = self.catalog_model(&pick);
+                    events.push(self.model_status());
+                }
                 if self.model.is_empty() {
                     let default = self
                         .catalog
@@ -2096,6 +2152,7 @@ impl Claude {
                         };
                         if !resolved.is_empty() {
                             self.model = resolved.to_string();
+                            self.model_guessed = true;
                             events.push(self.model_status());
                         }
                     }
@@ -2113,6 +2170,7 @@ impl Claude {
                 // The config directory as Claude Code resolved it (a program
                 // or settings file may set CLAUDE_CONFIG_DIR).
                 if let Some(dir) = reported_config(reply) {
+                    remember_config(&dir);
                     if let Some(program) = self.program.clone() {
                         probed()
                             .get_or_insert_with(HashMap::new)
@@ -2173,16 +2231,8 @@ impl Claude {
                 if pick.is_empty() {
                     return vec![];
                 }
-                let entry = self
-                    .catalog
-                    .iter()
-                    .find(|m| text(&m["value"]) == pick || text(&m["resolvedModel"]) == pick);
-                self.model = entry
-                    .map(|m| match text(&m["resolvedModel"]) {
-                        "" => text(&m["value"]).to_string(),
-                        r => r.to_string(),
-                    })
-                    .unwrap_or(pick);
+                self.model = self.catalog_model(&pick);
+                self.model_guessed = false;
                 self.context_window = self.model_windows.get(&self.model).copied().unwrap_or(0);
                 vec![self.model_status()]
             }
@@ -2590,6 +2640,7 @@ impl Claude {
                         && !to.is_empty()
                     {
                         self.model = to;
+                        self.model_guessed = false;
                         events.push(self.model_status());
                     }
                     events
@@ -2645,7 +2696,7 @@ impl Claude {
             "user" => self.on_user(&frame),
             "result" => return self.on_turn_end(&frame),
             "control_request" => return self.on_control_request(&frame),
-            "control_response" => self.on_control_response(&frame),
+            "control_response" => return self.on_control_answer(&frame),
             "rate_limit_event" => {
                 let events = rate_limit_events(&frame);
                 if let Some(limit) = events.iter().find(|e| e["type"] == "rate_limit") {
@@ -2670,8 +2721,10 @@ impl Claude {
             "user_message" => {
                 let frame = json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string();
                 // Mid-turn it waits here (as Codex's do) until the turn
-                // ends, or is steered in.
-                if self.active_turn || !self.held.is_empty() {
+                // ends, or is steered in. Behind a model switch the CLI has
+                // not confirmed yet, it waits for that answer: it runs on
+                // the model picked.
+                if self.active_turn || !self.held.is_empty() || !self.pending_model.is_empty() {
                     self.held.push(Held {
                         text: text(&op["content"]).trim().to_string(),
                         images: op["images"].clone(),
@@ -3099,9 +3152,7 @@ impl Adapter for Claude {
         let bypass = |mode: &str| mode == "bypassPermissions";
         (bypass(next) != bypass(self.mode)).then(|| Options {
             approval_mode: Some(next.to_string()),
-            model: (!self.model.is_empty())
-                .then(|| self.model.clone())
-                .or(self.requested_model.clone()),
+            model: self.model(),
             resume: (!self.conversation.is_empty()).then(|| self.conversation.clone()),
             resume_at: None,
             ..self.keep(Options::default())
@@ -3143,7 +3194,7 @@ impl Adapter for Claude {
     }
 
     fn model(&self) -> Option<String> {
-        (!self.model.is_empty())
+        (!self.model.is_empty() && !self.model_guessed)
             .then(|| self.model.clone())
             .or(self.requested_model.clone())
     }
@@ -3272,6 +3323,37 @@ pub fn config_dir_in(env: &[(String, String)]) -> PathBuf {
     }
 }
 
+/// The config directories Claude Code was seen to use besides
+/// `config_dir` (an `initialize` reply or a `probe` named them).
+static SEEN_CONFIGS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn remember_config(dir: &Path) {
+    let mut seen = SEEN_CONFIGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !seen.iter().any(|known| known == dir) {
+        seen.push(dir.to_path_buf());
+    }
+}
+
+/// Where saved conversations are looked for when no session says: the
+/// daemon's `config_dir`, then every other one Claude Code was seen to use
+/// since the daemon started (a session's environment or a program of the
+/// user's may set `CLAUDE_CONFIG_DIR`).
+pub fn config_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![config_dir()];
+    for dir in SEEN_CONFIGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+    {
+        if !dirs.contains(dir) {
+            dirs.push(dir.clone());
+        }
+    }
+    dirs
+}
+
 /// The config directories programs were seen to use (`probe`), by the
 /// program and the environment it runs with.
 type ProbeKey = (String, Vec<(String, String)>);
@@ -3322,6 +3404,7 @@ pub fn config_with(options: &Options, cwd: &Path, id: &str) -> PathBuf {
 /// Runs `probe` for `bin` with `env` and remembers what it found.
 fn reprobe(bin: String, env: &[(String, String)]) -> Option<PathBuf> {
     let dir = probe(&bin, env)?;
+    remember_config(&dir);
     probed()
         .get_or_insert_with(HashMap::new)
         .insert((bin, env.to_vec()), dir.clone());
@@ -3388,17 +3471,113 @@ fn probe(bin: &str, env: &[(String, String)]) -> Option<PathBuf> {
     dir
 }
 
-/// Claude Code's project directory for `cwd`: every character of the real
-/// path (Claude Code resolves symlinks, e.g. macOS `/tmp` → `/private/tmp`)
-/// that is not ASCII alphanumeric becomes `-`.
+/// The longest project folder name Claude Code writes before it adds a hash.
+const MAX_FOLDER_NAME: usize = 200;
+
+/// A path without the `\\?\` prefix Windows' `canonicalize` adds: Claude
+/// Code (Node's realpath) knows `C:\Users\me\x` and writes its folder as
+/// `C--Users-me-x`, never `----C--Users-me-x`.
+fn strip_verbatim(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+}
+
+/// Java's `String.hashCode` over UTF-16 units: the hash Claude Code
+/// appends to a long folder name, as `Math.abs(h).toString(36)`.
+fn java_hash(text: &str) -> i32 {
+    text.encode_utf16().fold(0i32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+    })
+}
+
+fn base36(mut n: u64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// The folder name Claude Code gives path `path` (its `sanitizePath`):
+/// every UTF-16 unit that is not an ASCII letter or digit becomes `-`
+/// (a JS regex without the `u` flag sees a surrogate pair as two), and a
+/// name longer than 200 is cut there and gets `-<hash>` appended.
+fn folder_name(path: &str) -> String {
+    let mut name = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c.is_ascii_alphanumeric() {
+            name.push(c);
+        } else {
+            name.extend(std::iter::repeat_n('-', c.len_utf16()));
+        }
+    }
+    if name.len() <= MAX_FOLDER_NAME {
+        return name;
+    }
+    let hash = i64::from(java_hash(path)).unsigned_abs();
+    format!("{}-{}", &name[..MAX_FOLDER_NAME], base36(hash))
+}
+
+/// Claude Code's project directory for `cwd`, named after its real path
+/// (Claude Code resolves symlinks, e.g. macOS `/tmp` → `/private/tmp`).
 fn project_dir(config: &Path, cwd: &Path) -> PathBuf {
     let real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let munged: String = real
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    config.join("projects").join(munged)
+    config
+        .join("projects")
+        .join(folder_name(&strip_verbatim(&real.to_string_lossy())))
+}
+
+/// The directories Claude Code may keep `cwd`'s conversations in: the one
+/// `project_dir` names, and for a long path every other one with the same
+/// cut name (a build that hashes the path another way).
+fn project_dirs(config: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let exact = project_dir(config, cwd);
+    let mut dirs = Vec::new();
+    if exact.is_dir() {
+        dirs.push(exact.clone());
+    }
+    let name = exact
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.len() <= MAX_FOLDER_NAME {
+        return dirs;
+    }
+    let prefix = format!("{}-", &name[..MAX_FOLDER_NAME]);
+    let Ok(entries) = fs::read_dir(config.join("projects")) else {
+        return dirs;
+    };
+    for entry in entries.flatten().take(2000) {
+        let path = entry.path();
+        if path != exact
+            && entry.file_name().to_string_lossy().starts_with(&prefix)
+            && path.is_dir()
+        {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
+/// The file conversation `id` of `cwd` is saved in, in config directory
+/// `config`.
+fn conversation_file(config: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+    if !is_conversation_id(id) {
+        return None;
+    }
+    let file = format!("{id}.jsonl");
+    project_dirs(config, cwd)
+        .into_iter()
+        .map(|dir| dir.join(&file))
+        .find(|path| path.is_file())
 }
 
 fn is_conversation_id(id: &str) -> bool {
@@ -3587,16 +3766,10 @@ pub fn transcript(config: &Path, cwd: &Path, id: &str, uploads: &Path) -> Vec<Va
 }
 
 fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value> {
-    if !is_conversation_id(id) {
-        return vec![];
+    match conversation_file(config, cwd, id) {
+        Some(path) => transcript_items(rows(&path, CONVERSATION_LIMIT), images),
+        None => vec![],
     }
-    transcript_items(
-        rows(
-            &project_dir(config, cwd).join(format!("{id}.jsonl")),
-            CONVERSATION_LIMIT,
-        ),
-        images,
-    )
 }
 
 /// How much of a saved conversation is read.
@@ -3688,11 +3861,10 @@ pub fn find_conversation(config: &Path, cwd: &Path, id: &str) -> Option<PathBuf>
     if !is_conversation_id(id) {
         return None;
     }
-    let file = format!("{id}.jsonl");
-    let here = project_dir(config, cwd).join(&file);
-    if here.is_file() {
+    if let Some(here) = conversation_file(config, cwd, id) {
         return Some(here);
     }
+    let file = format!("{id}.jsonl");
     fs::read_dir(config.join("projects"))
         .ok()?
         .flatten()
@@ -3800,29 +3972,30 @@ fn row_time(row: &Value) -> Option<i64> {
         .map(|t| t.timestamp_millis())
 }
 
-/// Conversations saved for `cwd` in config directory `config`, newest
-/// first: (id, title, updated ms).
-pub fn saved(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
-    saved_in(config, cwd)
+/// Conversations saved for `cwd` in any config directory Claude Code is
+/// known to use (`config_dirs`), newest first: (id, title, updated ms).
+pub fn saved(cwd: &Path) -> Vec<(String, String, u64)> {
+    let dirs: Vec<PathBuf> = config_dirs()
+        .iter()
+        .flat_map(|config| project_dirs(config, cwd))
+        .collect();
+    saved_in(&dirs)
 }
 
 /// Whether Claude Code saved conversation `id` for `cwd` in config directory
 /// `config` (it has at least one turn and can be resumed). Unlike `saved`,
 /// not limited to the newest ones.
 pub fn is_saved(config: &Path, cwd: &Path, id: &str) -> bool {
-    is_conversation_id(id)
-        && project_dir(config, cwd)
-            .join(format!("{id}.jsonl"))
-            .is_file()
+    conversation_file(config, cwd, id).is_some()
 }
 
-fn saved_in(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
-    let Ok(entries) = fs::read_dir(project_dir(config, cwd)) else {
-        return vec![];
-    };
-    let mut found: Vec<(String, u64, PathBuf)> = entries
-        .flatten()
-        .take(2000)
+/// The conversations saved in project directories `dirs`, newest first,
+/// each once.
+fn saved_in(dirs: &[PathBuf]) -> Vec<(String, String, u64)> {
+    let mut found: Vec<(String, u64, PathBuf)> = dirs
+        .iter()
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.flatten().take(2000))
         .filter_map(|entry| {
             let path = entry.path();
             let id = path.file_stem()?.to_str()?.to_string();
@@ -3841,6 +4014,8 @@ fn saved_in(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
         })
         .collect();
     found.sort_by_key(|(_, modified, _)| std::cmp::Reverse(*modified));
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|(id, _, _)| seen.insert(id.clone()));
     found.truncate(50);
     found
         .into_iter()
@@ -5674,7 +5849,7 @@ mod tests {
         )
         .unwrap();
         let items = transcript_in(&home.join(".claude"), cwd, "11-22", &home.join("images"));
-        let listed = saved_in(&home.join(".claude"), cwd);
+        let listed = saved_in(&project_dirs(&home.join(".claude"), cwd));
         assert_eq!(
             items,
             vec![
@@ -5697,6 +5872,268 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         #[cfg(unix)]
         assert_eq!(project_dir(&home, &link), project_dir(&home, &real));
+    }
+
+    #[test]
+    fn project_folders_are_named_as_claude_code_names_them() {
+        // Expected values from Claude Code 2.1.296's own function, run
+        // under node.
+        assert_eq!(folder_name(r"C:\Users\demo\proj"), "C--Users-demo-proj");
+        assert_eq!(folder_name("/Users/demo/a.b_c"), "-Users-demo-a-b-c");
+        assert_eq!(folder_name("/中文/路径 x"), "-------x");
+        assert_eq!(folder_name("/tmp/\u{1F600}x"), "-tmp---x");
+        let deep = format!(r"C:\Users\demo\{}proj", r"deep\".repeat(45));
+        let name = folder_name(&deep);
+        assert_eq!(name.len(), 207);
+        assert!(name.starts_with("C--Users-demo-deep-deep-"));
+        assert!(name.ends_with("-d-pkfbl9"), "{name}");
+        assert!(folder_name(&format!("/x/{}", "y".repeat(250))).ends_with("yyy-ldyyx2"));
+        // Windows' `canonicalize` adds `\\?\`; Claude Code's path has none.
+        assert_eq!(strip_verbatim(r"\\?\C:\Users\demo"), r"C:\Users\demo");
+        assert_eq!(
+            strip_verbatim(r"\\?\UNC\server\share\x"),
+            r"\\server\share\x"
+        );
+        assert_eq!(strip_verbatim("/Users/demo"), "/Users/demo");
+    }
+
+    /// The daemon reads back a conversation where Claude Code saved it: on
+    /// Windows `C--Users-…`, not `----C--…` (looking there, a GUI → TUI →
+    /// GUI round trip found no conversation, showed none and started it
+    /// again with `--session-id`).
+    #[test]
+    fn project_folders_of_real_directories_match_claude_codes() {
+        let dir = std::env::temp_dir().join(format!("claude-real-{}", std::process::id()));
+        let cwd = dir.join("work");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = dir.join("config");
+        let folder = project_dir(&config, &cwd);
+        let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+        if cfg!(windows) {
+            assert!(
+                name.as_bytes()[0].is_ascii_alphabetic() && &name[1..3] == "--",
+                "{name}"
+            );
+        } else {
+            assert!(name.starts_with('-'), "{name}");
+        }
+        let real = cwd.canonicalize().unwrap();
+        assert_eq!(name, folder_name(&strip_verbatim(&real.to_string_lossy())));
+        assert!(!is_saved(&config, &cwd, "aa-11"));
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join("aa-11.jsonl"),
+            json!({ "type": "user", "message": { "content": "hi" } }).to_string() + "\n",
+        )
+        .unwrap();
+        assert!(is_saved(&config, &cwd, "aa-11"));
+        assert_eq!(
+            transcript_in(&config, &cwd, "aa-11", &dir.join("images")),
+            vec![json!({ "role": "user", "content": "hi" })]
+        );
+        assert_eq!(
+            saved_in(&project_dirs(&config, &cwd))[0].0,
+            "aa-11".to_string()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_folders_of_long_paths_are_found_by_their_cut_name() {
+        let config = std::env::temp_dir().join(format!("claude-long-{}", std::process::id()));
+        let cwd = PathBuf::from(format!("/never/{}", "long-folder-name/".repeat(14)));
+        let name = project_dir(&config, &cwd)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.len() > MAX_FOLDER_NAME);
+        // Written by a build that hashes the path another way.
+        let other = config
+            .join("projects")
+            .join(format!("{}-zzzz", &name[..MAX_FOLDER_NAME]));
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(config.join("projects").join("-never-else")).unwrap();
+        fs::write(
+            other.join("bb-22.jsonl"),
+            json!({ "type": "user", "message": { "content": "deep" } }).to_string() + "\n",
+        )
+        .unwrap();
+        assert_eq!(project_dirs(&config, &cwd), vec![other.clone()]);
+        assert!(is_saved(&config, &cwd, "bb-22"));
+        assert_eq!(
+            find_conversation(&config, &cwd, "bb-22"),
+            Some(other.join("bb-22.jsonl"))
+        );
+        assert_eq!(
+            transcript_in(&config, &cwd, "bb-22", &config.join("images"))[0]["content"],
+            "deep"
+        );
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// A launcher that sets its own `CLAUDE_CONFIG_DIR`: once Claude Code
+    /// names the directory, the history lists what it saved there.
+    #[test]
+    fn conversations_are_listed_from_every_config_directory_claude_code_used() {
+        let dir = std::env::temp_dir().join(format!("claude-seen-{}", std::process::id()));
+        let cwd = dir.join("work");
+        fs::create_dir_all(&cwd).unwrap();
+        let launcher = dir.join("launcher-config");
+        let folder = project_dir(&launcher, &cwd);
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join("cc-33.jsonl"),
+            json!({ "type": "user", "message": { "content": "from the launcher" } }).to_string()
+                + "\n",
+        )
+        .unwrap();
+        assert!(!saved(&cwd).iter().any(|(id, _, _)| id == "cc-33"));
+        let mut c = claude();
+        let boot = c.start();
+        frame(
+            &mut c,
+            reply(
+                request_id(&boot, "initialize"),
+                json!({ "commands": [], "user_output_styles_dir": launcher.join("output-styles") }),
+            ),
+        );
+        assert_eq!(config_dirs()[0], config_dir());
+        assert!(config_dirs().contains(&launcher));
+        let listed = saved(&cwd);
+        let found = listed.iter().find(|(id, _, _)| id == "cc-33").unwrap();
+        assert_eq!(found.1, "from the launcher");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A saved conversation goes on with `--resume` (Claude Code refuses
+    /// `--session-id` for it: "Session ID … is already in use"), a new one
+    /// starts under its id; both on the session's model.
+    #[test]
+    fn a_saved_conversation_is_resumed_and_a_new_one_started_under_its_id() {
+        let argv = |command: Command| -> Vec<String> {
+            command
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect()
+        };
+        let options = Options {
+            model: Some("claude-haiku-5-5".into()),
+            ..Options::default()
+        };
+        let resumed = Options {
+            resume: Some("s-1".into()),
+            ..options.clone()
+        };
+        for (args, flag) in [
+            (argv(command("s-1", &options)), "--session-id"),
+            (argv(command("s-1", &resumed)), "--resume"),
+            (argv(tui("s-1", &options, false)), "--session-id"),
+            (argv(tui("s-1", &options, true)), "--resume"),
+        ] {
+            assert!(args.windows(2).any(|w| w == [flag, "s-1"]), "{args:?}");
+            let other = if flag == "--resume" {
+                "--session-id"
+            } else {
+                "--resume"
+            };
+            assert!(!args.contains(&other.to_string()), "{args:?}");
+            assert!(
+                args.windows(2)
+                    .any(|w| w == ["--model", "claude-haiku-5-5"]),
+                "{args:?}"
+            );
+        }
+    }
+
+    fn catalog() -> Value {
+        json!({ "models": [
+            { "value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default (recommended)" },
+            { "value": "haiku", "resolvedModel": "claude-haiku-5-5", "displayName": "Haiku" },
+        ] })
+    }
+
+    /// Started with `--model`, the session shows that model from the start
+    /// (not the CLI's default), and a restart or the TUI carries it on.
+    #[test]
+    fn a_session_started_on_a_model_shows_it_before_its_first_turn() {
+        let mut c = Claude::new(&Options {
+            model: Some("haiku".into()),
+            ..Options::default()
+        });
+        let boot = c.start();
+        let events = frame(&mut c, reply(request_id(&boot, "list_models"), catalog()));
+        let status = events.iter().find(|e| e["type"] == "model_status").unwrap();
+        assert_eq!(status["model"], "claude-haiku-5-5");
+        assert_eq!(c.model().as_deref(), Some("claude-haiku-5-5"));
+        // Nothing asked for: the CLI's default is shown, and left to the
+        // CLI on a restart until a turn says which it is.
+        let mut c = claude();
+        let boot = c.start();
+        let events = frame(&mut c, reply(request_id(&boot, "list_models"), catalog()));
+        let status = events.iter().find(|e| e["type"] == "model_status").unwrap();
+        assert_eq!(status["model"], "claude-opus-5-5");
+        assert_eq!(c.model(), None);
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5-5" }),
+        );
+        assert_eq!(c.model().as_deref(), Some("claude-opus-5-5"));
+    }
+
+    /// A model switch goes first: the message sent right behind it waits
+    /// until the CLI answers the switch, then runs on the model picked.
+    #[test]
+    fn a_message_behind_a_model_switch_waits_until_the_cli_answers_it() {
+        let mut c = claude();
+        let boot = c.start();
+        frame(&mut c, reply(request_id(&boot, "list_models"), catalog()));
+        let switch = c
+            .encode(&json!({ "op": "command", "input": "/model haiku" }))
+            .unwrap()
+            .frames;
+        let sent = c
+            .encode(&json!({ "op": "user_message", "content": "hi" }))
+            .unwrap();
+        assert!(sent.frames.is_empty(), "{:?}", sent.frames);
+        assert_eq!(sent.events[0]["messages"], json!(["hi"]));
+        assert!(c.busy());
+        // Another answer (get_settings) does not let it go.
+        let other = c.translate(Line::Frame(reply(
+            request_id(&switch, "get_settings"),
+            json!({ "applied": {} }),
+        )));
+        assert!(other.frames.is_empty());
+        let answered = c.translate(Line::Frame(reply(
+            request_id(&switch, "set_model"),
+            json!({}),
+        )));
+        assert!(
+            answered
+                .events
+                .iter()
+                .any(|e| e["type"] == "model_status" && e["model"] == "claude-haiku-5-5"),
+            "{:?}",
+            answered.events
+        );
+        assert_eq!(answered.frames.len(), 1);
+        assert!(answered.frames[0].contains(r#""text":"hi""#));
+        assert_eq!(c.model().as_deref(), Some("claude-haiku-5-5"));
+
+        // A switch the CLI refuses lets the message go too; the error says why.
+        let mut c = claude();
+        let switch = c
+            .encode(&json!({ "op": "command", "input": "/model nope" }))
+            .unwrap()
+            .frames;
+        assert!(c
+            .encode(&json!({ "op": "user_message", "content": "hi" }))
+            .unwrap()
+            .frames
+            .is_empty());
+        let refused = c.translate(Line::Frame(json!({ "type": "control_response", "response": { "subtype": "error", "request_id": request_id(&switch, "set_model"), "error": "unknown model nope" } })));
+        assert!(refused.events.iter().any(|e| e["type"] == "error"));
+        assert_eq!(refused.frames.len(), 1);
     }
 
     #[test]

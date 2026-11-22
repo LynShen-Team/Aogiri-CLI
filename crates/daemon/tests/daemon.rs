@@ -2449,6 +2449,78 @@ fn a_new_claude_conversation_starts_in_its_tui() {
     );
 }
 
+/// A model picked after the session started (`/model`) is the one its
+/// first message runs on, its TUI starts on and the engine after the TUI
+/// resumes on, with the conversation shown again.
+#[test]
+fn a_picked_model_runs_on_through_the_tui_and_back() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-tui-model");
+    fs::create_dir_all(&dir).unwrap();
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude" }),
+    );
+    let session = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(is_ready(&session));
+    // The pick and the first message right behind it.
+    desktop.send(json!({ "op": "command", "session": session, "input": "/model haiku" }));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "which model" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(claude_reply(&frames, &session), "model: claude-haiku-4-5");
+    assert!(
+        !starts(&log)[0].contains(&"--model".to_string()),
+        "{:?}",
+        starts(&log)[0]
+    );
+
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_tui", "session": session, "cols": 100, "rows": 30 }),
+    );
+    let term = opened["term"].as_str().unwrap().to_string();
+    let started = format!("TUI {session} on claude-haiku-4-5");
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains(&started));
+    let args = &starts(&log)[1];
+    assert!(
+        args.windows(2).any(|w| w == ["--resume", session.as_str()]),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--model", "claude-haiku-4-5"]),
+        "{args:?}"
+    );
+    // Back without a word in the TUI.
+    type_in(&mut desktop, &term, "exit\n");
+    let frames = desktop.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
+    assert_eq!(
+        without_uuids(&frames.last().unwrap()["items"]),
+        json!([
+            { "role": "user", "content": "which model" },
+            { "role": "assistant", "content": "model: claude-haiku-4-5" },
+        ])
+    );
+    let args = &starts(&log)[2];
+    assert!(args.contains(&"--print".to_string()), "{args:?}");
+    assert!(
+        args.windows(2).any(|w| w == ["--resume", session.as_str()]),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--model", "claude-haiku-4-5"]),
+        "{args:?}"
+    );
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "which model" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(claude_reply(&frames, &session), "model: claude-haiku-4-5");
+}
+
 #[test]
 fn a_running_turn_moves_to_the_tui_only_when_forced() {
     let _guard = setup();
@@ -3129,6 +3201,17 @@ fn a_conversation_saved_where_the_users_program_says_reopens_by_resuming() {
             .windows(2)
             .any(|w| w == ["--resume", session.as_str()]),
         "{again:?}"
+    );
+    // The directory's history lists it from there too.
+    let mut client = Client::connect(&daemon);
+    let history = request(&mut client, json!({ "op": "session_history", "cwd": dir }));
+    assert!(
+        history["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["session"] == session.as_str() && s["engine"] == "claude"),
+        "{history}"
     );
 }
 

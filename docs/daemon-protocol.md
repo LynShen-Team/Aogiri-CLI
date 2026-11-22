@@ -624,10 +624,16 @@ without a conversation and reads the directory from Claude Code's
 `initialize` reply, remembers it for that program and environment, and asks
 again when the conversation is not where it was seen. A running session
 takes the directory Claude Code reports, and keeps it across restarts and
-the TUI handoff. So a saved conversation is resumed, never started again
-under its id (which Claude Code refuses: "Session ID … is already in use"),
-and its history shows. `session_created` for Codex comes once its thread
-is open.
+the TUI handoff. Inside it, a conversation is in
+`projects/<folder>/<id>.jsonl`, the folder named as Claude Code names it:
+the directory's real path (without the `\\?\` prefix Windows adds) with
+every character but ASCII letters and digits as `-`, and a name longer than
+200 cut there with a hash appended (any hash: builds differ). So a saved
+conversation is resumed, never started again under its id (which Claude Code
+refuses: "Session ID … is already in use"), and its history shows.
+`session_history` lists Claude Code's conversations from the daemon's
+directory and every other one a Claude Code run reported since the daemon
+started. `session_created` for Codex comes once its thread is open.
 Every session in `session_list` carries its `engine` (and an ACP session
 the `acp_agent` it was created with: the desktop's `{id, name}`, or a
 built-in agent's `{id, name, builtin: true}`), and a Claude Code / Codex
@@ -1249,8 +1255,10 @@ empty `background_tasks`), and the TUI resumes the same conversation
 ACP agent's own session id: see "Built-in ACP agents"); a conversation the
 engine has not saved yet starts there instead (`claude --session-id <id>`,
 plain `codex`, whose new thread the daemon finds in the directory when the
-TUI exits) with the session's approval mode and model; under the gateway or
-a custom provider it gets its own key. Every client of the session gets
+TUI exits) with the session's approval mode and model (the one it runs
+now, a `/model` switch included, which the engine after the TUI runs on
+too); under the gateway or a custom provider it gets its own key. Every
+client of the session gets
 `{"type":"surface","session":"<id>","surface":"tui","term":"t-…","client":1}`,
 also in a watcher's snapshot: that is the terminal to `term_attach` (a phone
 views the TUI this way). While the TUI runs, ops on the session other than

@@ -1494,7 +1494,12 @@ impl Session<'_> {
                 if busy && request["force"] != true {
                     self.refuse(&request, "the running turn must end first".to_string());
                 } else {
-                    let keep = adapter.keep(current.clone());
+                    // The TUI and the engine after it run the model the
+                    // session runs now, a switch since it started included.
+                    let keep = Options {
+                        model: adapter.model().or(current.model.clone()),
+                        ..adapter.keep(current.clone())
+                    };
                     if let Some(tui) = self.tui_for(adapter.as_ref(), &keep, &request) {
                         // The TUI resumes the conversation file at once: no
                         // grace period in which a cut-off turn still writes it.
