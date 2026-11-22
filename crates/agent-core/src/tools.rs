@@ -159,7 +159,7 @@ pub fn definitions() -> Vec<Value> {
                 "properties": {
                     "command": { "type": "string" },
                     "workdir": { "type": "string" },
-                    "timeout": { "type": "number", "description": "Seconds: default 60, at most 600. With yield_time_ms: default 3600, at most 86400, and the command is ended then." },
+                    "timeout": { "type": "number", "description": "Seconds (default 60, max 600; with yield_time_ms 3600, max 86400)." },
                     "yield_time_ms": { "type": "number", "description": "Return early after this many ms if still running (servers, watchers, long jobs)." }
                 },
                 "required": ["command"]
@@ -174,7 +174,7 @@ pub fn definitions() -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "number" },
                     "text": { "type": "string", "description": "Omit to only poll." },
-                    "close_stdin": { "type": "boolean", "description": "End its input after text (EOF, as Ctrl-D in a terminal), for a command that reads until then, such as cat > file." },
+                    "close_stdin": { "type": "boolean" },
                     "yield_time_ms": { "type": "number", "description": "How long to wait for output, default 1000." }
                 },
                 "required": ["session_id"]
