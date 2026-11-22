@@ -1017,7 +1017,7 @@ mod tests {
             "apply_patch",
             "with write",
             "heredoc",
-            "with bash",
+            "files with bash",
         ] {
             assert!(!prompt.contains(disabled), "guidance names {disabled}");
         }
