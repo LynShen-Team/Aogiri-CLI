@@ -378,7 +378,14 @@ How each shell runs a command:
   and `[Console]::InputEncoding` to UTF-8 (without a BOM) and turns off
   progress bars. Without it, Chinese text is garbled under a GBK code page.
 - Git Bash: `bash.exe -lc`, with `CHERE_INVOKING=1` so that its
-  `/etc/profile` stays in the working directory.
+  `/etc/profile` stays in the working directory. The command itself goes in
+  the `LYNSHEN_COMMAND` variable, which the shell takes out of its
+  environment and `eval`s, not on the command line: the MSYS2 runtime cuts
+  a command-line argument from a Windows program after 8,186 characters and
+  turns `\\` into `\`, and Windows refuses a command line longer than
+  32,767 characters, so a file written with a long heredoc came out
+  truncated or not at all. The same goes for any other POSIX shell on
+  Windows.
 - zsh and bash: `-c`, in the login environment (below). Without one,
   `-lc`; when even `-lc` does not start within 5 seconds, `/bin/sh -c`.
 - sh: `sh -lc`, as before this setting.

@@ -49,6 +49,16 @@ const SNAPSHOT_END: &str = "__LYNSHEN_ENV_END__";
 /// Variables the snapshot leaves out: the snapshot shell's own state.
 const SNAPSHOT_SKIP: [&str; 5] = ["PWD", "OLDPWD", "SHLVL", "_", SNAPSHOT_FILE_VAR];
 
+/// Carries the command to a POSIX shell on Windows (Git Bash): see
+/// `CommandShell::invocation`.
+pub const COMMAND_VAR: &str = "LYNSHEN_COMMAND";
+
+/// What such a shell is told to run: the command in `COMMAND_VAR`, taken out
+/// of the environment first so the programs it starts do not inherit it. A
+/// shell that did not get the variable fails instead of running nothing.
+pub const RUN_COMMAND_VAR: &str =
+    "__lynshen_command=${LYNSHEN_COMMAND?}; unset LYNSHEN_COMMAND; eval \"$__lynshen_command\"";
+
 /// Runs before each PowerShell command: UTF-8 both ways (else Chinese text
 /// is garbled under a GBK console code page), and no progress bars. Setting
 /// the console's encoding fails without a console, which is fine.
@@ -1051,6 +1061,13 @@ impl CommandShell {
 
     /// The command line that runs `command`, with the model's variables
     /// (`MODEL_ENV`).
+    ///
+    /// A POSIX shell on Windows (Git Bash, an MSYS2 program) gets the
+    /// command in `COMMAND_VAR`, not on its command line: the MSYS2 runtime
+    /// re-parses a command line from a Windows program through its glob
+    /// step, which cuts an argument after 8,186 characters and turns `\\`
+    /// into `\`, and Windows refuses a command line over 32,767 characters.
+    /// A file written with a heredoc came out truncated or not at all.
     pub fn invocation(&self, command: &str) -> Invocation {
         let mut env: Vars = self.env.as_deref().cloned().unwrap_or_default();
         let args = if self.shell.kind.powershell() {
@@ -1063,7 +1080,12 @@ impl CommandShell {
             ]
         } else {
             let flag = if self.login { "-lc" } else { "-c" };
-            vec![flag.to_string(), command.to_string()]
+            if self.platform == Platform::Windows {
+                env.push((COMMAND_VAR.into(), command.into()));
+                vec![flag.to_string(), RUN_COMMAND_VAR.to_string()]
+            } else {
+                vec![flag.to_string(), command.to_string()]
+            }
         };
         let set = |env: &Vars, name: &str| {
             env.iter().any(|(key, _)| key == name) || std::env::var_os(name).is_some()
@@ -1852,13 +1874,21 @@ mod tests {
             format!("{POWERSHELL_PRELUDE}\ndir")
         );
 
+        // Git Bash gets the command in a variable, never on its command
+        // line (MSYS2 cuts a long argument and halves its backslashes).
         let git_bash = command_shell(Kind::GitBash, r"C:\Git\bin\bash.exe", Platform::Windows);
-        let line = git_bash.invocation("ls");
-        assert_eq!(line.args, ["-lc", "ls"]);
+        let heredoc = format!("cat > a.txt <<'EOF'\n{}\nEOF", "x\\\\y ".repeat(5_000));
+        let line = git_bash.invocation(&heredoc);
+        assert_eq!(line.args, ["-lc", RUN_COMMAND_VAR]);
+        assert_eq!(value(&line, COMMAND_VAR), Some(OsStr::new(&heredoc)));
         assert_eq!(value(&line, "CHERE_INVOKING"), Some(OsStr::new("1")));
+        let windows_sh = command_shell(Kind::Sh, r"C:\tools\sh.exe", Platform::Windows);
+        assert_eq!(windows_sh.invocation("ls").args, ["-lc", RUN_COMMAND_VAR]);
 
         let sh = command_shell(Kind::Sh, "sh", Platform::Linux);
-        assert_eq!(sh.invocation("ls").args, ["-lc", "ls"]);
+        let line = sh.invocation("ls");
+        assert_eq!(line.args, ["-lc", "ls"]);
+        assert_eq!(value(&line, COMMAND_VAR), None);
 
         // With the login environment: `-c`, in that environment.
         let mut zsh = command_shell(Kind::Zsh, "/bin/zsh", Platform::MacOs);
@@ -2189,5 +2219,46 @@ mod tests {
         let name = dir.0.file_name().unwrap().to_string_lossy().to_lowercase();
         assert!(text.starts_with("42"), "{text}");
         assert!(text.contains(&name), "{text}");
+    }
+
+    /// A file written with a heredoc arrives whole: past the 8,186
+    /// characters MSYS2 keeps of a command-line argument, past the 32,767 a
+    /// Windows command line holds, and with its `\\` left as they are.
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_writes_long_heredocs_whole() {
+        let Some(bash) = windows_shell(Kind::GitBash) else {
+            assert!(
+                env::var_os("GITHUB_ACTIONS").is_none(),
+                "windows-latest has Git Bash"
+            );
+            return;
+        };
+        let dir = Dir::new("git-bash-heredoc");
+        let line_text = "path C:\\\\Users\\\\me \"quoted\" 'single' $HOME `tick` 中文\n";
+        for size in [20_000, 40_000] {
+            let mut body = String::new();
+            while body.chars().count() < size {
+                body.push_str(line_text);
+            }
+            let command = format!("cat > out.txt <<'EOF'\n{body}EOF\necho written");
+            let line = bash.invocation(&command);
+            let output = Command::new(&line.program)
+                .args(&line.args)
+                .envs(line.env.iter().cloned())
+                .current_dir(&dir.0)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{size}: {output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim_end(),
+                "written",
+                "{size}"
+            );
+            let written = fs::read_to_string(dir.path("out.txt")).unwrap();
+            assert_eq!(written.len(), body.len(), "{size}");
+            assert!(written == body, "{size}: the file differs from the heredoc");
+        }
     }
 }
