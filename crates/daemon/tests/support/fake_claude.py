@@ -18,6 +18,12 @@ fork = "--fork-session" in args
 source = arg("--resume") if fork else None
 session = arg("--session-id") if fork else (arg("--resume") or arg("--session-id"))
 mode = "bypassPermissions" if "--dangerously-skip-permissions" in args else (arg("--permission-mode") or "default")
+# The model a turn runs on: --model, then what set_model picks; an alias
+# resolves as list_models lists it.
+ALIASES = {"sonnet": "claude-sonnet-4-5", "haiku": "claude-haiku-4-5"}
+picked = [arg("--model")]
+def running_model():
+    return ALIASES.get(picked[0], picked[0]) if picked[0] else "claude-sonnet-4-5"
 cwd = os.getcwd()
 config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.environ["HOME"], ".claude")
 saved = os.path.join(config, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
@@ -83,7 +89,7 @@ def read():
 # turn saved to the conversation, until "exit".
 if "--print" not in args:
     out_line = lambda text: (sys.stdout.write(text + "\r\n"), sys.stdout.flush())
-    out_line("TUI " + session)
+    out_line("TUI " + session + " on " + running_model())
     for line in sys.stdin:
         line = line.strip()
         if line == "exit":
@@ -105,7 +111,9 @@ while True:
             mode = request["mode"]
             response = {"mode": mode}
         elif request["subtype"] == "list_models":
-            response = {"models": [{"value": "sonnet", "resolvedModel": "claude-sonnet-4-5", "displayName": "Sonnet"}]}
+            response = {"models": [{"value": "sonnet", "resolvedModel": "claude-sonnet-4-5", "displayName": "Sonnet"}, {"value": "haiku", "resolvedModel": "claude-haiku-4-5", "displayName": "Haiku"}]}
+        elif request["subtype"] == "set_model":
+            picked[0] = request.get("model")
         elif request["subtype"] == "initialize":
             response = {"commands": [{"name": "compact", "description": "Free up context", "argumentHint": "", "builtin": True}], "pid": os.getpid(), "user_output_styles_dir": os.path.join(config, "output-styles")}
         out({"type": "control_response", "response": {"subtype": "success", "request_id": frame["request_id"], "response": response}})
@@ -114,7 +122,7 @@ while True:
         continue
     text = frame["message"]["content"][0]["text"]
     out({"type": "user", "isReplay": True, "message": frame["message"]})
-    out({"type": "system", "subtype": "init", "session_id": session, "model": "claude-sonnet-4-5", "permissionMode": mode, "cwd": cwd, "slash_commands": ["compact"]})
+    out({"type": "system", "subtype": "init", "session_id": session, "model": running_model(), "permissionMode": mode, "cwd": cwd, "slash_commands": ["compact"]})
     out({"type": "system", "subtype": "status", "status": "requesting"})
     save("user", text)
     if "tool" in text:
@@ -145,7 +153,7 @@ while True:
         except Exception as error:
             status = "failed " + str(error)
         text = "%s %s" % (text, status)
-    reply = "mode: " + mode if text == "which mode" else "ok: " + text
+    reply = "mode: " + mode if text == "which mode" else "model: " + running_model() if text == "which model" else "ok: " + text
     out({"type": "stream_event", "event": {"type": "message_start", "message": {"usage": {"input_tokens": 5}}}})
     out({"type": "assistant", "uuid": "u-1", "message": {"content": [{"type": "text", "text": reply}]}})
     if text.startswith("api"):

@@ -935,12 +935,11 @@ impl Hub {
                         .map_err(|error| error.to_string())?
                         .iter()
                         .any(|summary| summary.id == id),
-                    Some(engines::Kind::Claude) => engines::claude::saved(
+                    Some(engines::Kind::Claude) => engines::claude::is_saved(
                         &engines::claude::config_with(&options, &cwd, id),
                         &cwd,
-                    )
-                    .iter()
-                    .any(|(saved, _, _)| saved == id),
+                        id,
+                    ),
                     Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),
@@ -2739,7 +2738,7 @@ impl Hub {
                 )
             })
             .chain(
-                engines::claude::saved(&engines::claude::config_dir(), cwd)
+                engines::claude::saved(cwd)
                     .into_iter()
                     .map(|(id, title, updated_at)| {
                         item(id, title, updated_at, Value::Null, "claude")

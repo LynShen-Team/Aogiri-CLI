@@ -91,6 +91,11 @@ jobs:
       - name: Process group tests
         run: cargo test -p lynshen-agent-core --lib process_group
 
+      # Claude Code's project folders: a Windows path (with the `\\?\`
+      # prefix `canonicalize` adds) names the folder Claude Code writes.
+      - name: Claude Code project folder tests
+        run: cargo test -p lynshen-daemon --lib engines::claude::tests::project_folders
+
   # The Windows sandbox (sandbox_windows = "restricted-token", opt-in): the
   # crate's policy checks, then the engine's path through the real
   # `lynshen __sandbox-exec` runner and the shells. Both tests print every
