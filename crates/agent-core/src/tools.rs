@@ -18,6 +18,18 @@ use std::{
 };
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
+/// Longest a command may hold the turn: longer work goes to the background
+/// (`yield_time_ms`).
+const MAX_BASH_TIMEOUT_SECS: u64 = 600;
+/// A `timeout` from this up, for a command that holds the turn, is in
+/// milliseconds, as models used to Claude Code's Bash write it: 120000 is two
+/// minutes, not 33 hours. In seconds it would be past the cap anyway.
+const MILLISECOND_TIMEOUT_FROM: u64 = 10_000;
+/// A command left running in the background (`yield_time_ms`) that sets no
+/// timeout, and the most one may set: past it the command is ended, whether
+/// or not anyone polls it.
+const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 3_600;
+const MAX_BACKGROUND_TIMEOUT_SECS: u64 = 86_400;
 const MAX_IMAGE_READ_BYTES: u64 = 1024 * 1024;
 /// Largest image a user can attach to a message: 3.75 MB of file is 5 MB of
 /// base64, the per-image limit of the Messages API (the Claude Code engine
@@ -147,7 +159,7 @@ pub fn definitions() -> Vec<Value> {
                 "properties": {
                     "command": { "type": "string" },
                     "workdir": { "type": "string" },
-                    "timeout": { "type": "number", "description": "Seconds, default 60." },
+                    "timeout": { "type": "number", "description": "Seconds (default 60, max 600; with yield_time_ms 3600, max 86400)." },
                     "yield_time_ms": { "type": "number", "description": "Return early after this many ms if still running (servers, watchers, long jobs)." }
                 },
                 "required": ["command"]
@@ -162,6 +174,7 @@ pub fn definitions() -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "number" },
                     "text": { "type": "string", "description": "Omit to only poll." },
+                    "close_stdin": { "type": "boolean" },
                     "yield_time_ms": { "type": "number", "description": "How long to wait for output, default 1000." }
                 },
                 "required": ["session_id"]
@@ -1492,12 +1505,12 @@ fn bash(
             });
         }
     }
-    let timeout = match optional_u64(args, "timeout") {
-        Ok(timeout) => Duration::from_secs(timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS).max(1)),
-        Err(error) => return json!({ "command": command, "error": error }),
-    };
     let yield_time = match optional_u64(args, "yield_time_ms") {
         Ok(yield_time) => yield_time.map(Duration::from_millis),
+        Err(error) => return json!({ "command": command, "error": error }),
+    };
+    let timeout = match optional_u64(args, "timeout") {
+        Ok(timeout) => command_timeout(timeout, yield_time.is_some()),
         Err(error) => return json!({ "command": command, "error": error }),
     };
 
@@ -1531,8 +1544,17 @@ fn bash(
             emit,
         )
     } else {
-        run_command_events(program, &shell_args, env, None, &workdir, timeout, emit)
-            .map(|result| command_result_json(command, Ok(result)))
+        run_command_events(
+            program,
+            &shell_args,
+            command,
+            env,
+            None,
+            &workdir,
+            timeout,
+            emit,
+        )
+        .map(|result| command_result_json(command, Ok(result)))
     };
     let sandboxed = !escalated && sandbox.is_some_and(|sandbox| sandbox.enforced());
     match result {
@@ -1545,6 +1567,22 @@ fn bash(
         }
         Err(error) => json!({ "command": command, "error": error }),
     }
+}
+
+/// How long a command may run: the call's `timeout` in seconds, read as
+/// milliseconds from `MILLISECOND_TIMEOUT_FROM` up for a command that holds
+/// the turn, and capped, so no call can keep a hung command for hours.
+fn command_timeout(requested: Option<u64>, background: bool) -> Duration {
+    let seconds = match (requested, background) {
+        (None, false) => DEFAULT_BASH_TIMEOUT_SECS,
+        (None, true) => DEFAULT_BACKGROUND_TIMEOUT_SECS,
+        (Some(value), false) if value >= MILLISECOND_TIMEOUT_FROM => {
+            value.div_ceil(1000).min(MAX_BASH_TIMEOUT_SECS)
+        }
+        (Some(value), false) => value.min(MAX_BASH_TIMEOUT_SECS),
+        (Some(value), true) => value.min(MAX_BACKGROUND_TIMEOUT_SECS),
+    };
+    Duration::from_secs(seconds.max(1))
 }
 
 /// A failed command whose output reads like the sandbox stopped it: tell
@@ -1603,7 +1641,13 @@ fn write_stdin(args: &Value, state: &ToolState) -> Value {
         Ok(None) => return json!({ "error": "missing session_id" }),
         Err(error) => return json!({ "error": error }),
     };
+    // A trailing Ctrl-D ends the input, as it does in a terminal.
     let text = stdin_text(args);
+    let (text, ctrl_d) = match text.strip_suffix('\u{4}') {
+        Some(text) => (text, true),
+        None => (text, false),
+    };
+    let close = ctrl_d || args.get("close_stdin").and_then(Value::as_bool) == Some(true);
     let yield_time = match optional_u64(args, "yield_time_ms") {
         Ok(yield_time) => Duration::from_millis(yield_time.unwrap_or(1000)),
         Err(error) => return json!({ "session_id": session_id, "error": error }),
@@ -1612,7 +1656,7 @@ fn write_stdin(args: &Value, state: &ToolState) -> Value {
     // in this process and finished, whose result is repeated rather than
     // reported as a missing session.
     let result = if state.owns_shell(session_id) {
-        poll_or_write_session(session_id, text, yield_time)
+        poll_or_write_session(session_id, text, close, yield_time)
     } else {
         finished_or_unknown(session_id, !text.is_empty())
     };
@@ -1659,8 +1703,7 @@ fn run_command_session(
     let stdin = child.stdin.take();
     let started = SystemTime::now();
     if let Err(error) = emit(ToolExecutionEvent::Update(format!(
-        "started: {}",
-        command_display(program, args)
+        "started: {display_command}"
     ))) {
         abort_command(&mut child, &stdout_path, &stderr_path);
         return Err(error);
@@ -1709,6 +1752,7 @@ fn run_command_session(
                 timeout,
             },
         );
+    end_session_at_timeout(session_id, started, timeout);
 
     Ok(json!({
         "command": display_command,
@@ -1724,66 +1768,43 @@ fn run_command_session(
 fn poll_or_write_session(
     session_id: u64,
     text: &str,
+    close: bool,
     yield_time: Duration,
 ) -> Result<Value, String> {
     let started_poll = SystemTime::now();
-    let mut wrote_stdin = false;
+    let mut delivered = false;
     loop {
-        let mut finished = None;
         {
             let mut sessions = shell_sessions()
                 .lock()
                 .map_err(|_| "shell session lock is poisoned".to_string())?;
+            if let Some(result) = settle_session(&mut sessions, session_id)? {
+                return Ok(result);
+            }
             let Some(session) = sessions.get_mut(&session_id) else {
                 drop(sessions);
                 return finished_or_unknown(session_id, !text.is_empty());
             };
-            if session.started.elapsed().unwrap_or_default() >= session.timeout {
-                kill_child(&mut session.child);
-                finished = Some((true, None, None));
-            } else if let Some(status) = session
-                .child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-            {
-                finished = Some((false, status.code(), status_signal(&status)));
-            }
-            if let Some((timed_out, code, signal)) = finished {
-                let session = sessions.remove(&session_id).expect("session exists");
-                let result = collect_command_result(
-                    code,
-                    signal,
-                    timed_out,
-                    &session.stdout_path,
-                    &session.stderr_path,
-                );
-                return Ok(remember_finished(
-                    session_id,
-                    command_result_json(&session.command, Ok(result)),
-                ));
-            }
-            if !text.is_empty() && !wrote_stdin {
-                if let Some(stdin) = session.stdin.as_mut() {
+            if !delivered {
+                delivered = true;
+                if !text.is_empty() {
+                    let Some(stdin) = session.stdin.as_mut() else {
+                        return Err(format!(
+                            "the input of shell session {session_id} is closed (close_stdin): it takes no more"
+                        ));
+                    };
                     if let Err(error) = stdin.write_all(text.as_bytes()).and_then(|_| stdin.flush())
                     {
-                        if let Ok(Some(status)) = session.child.try_wait() {
-                            let signal = status_signal(&status);
-                            let session = sessions.remove(&session_id).expect("session exists");
-                            let result = collect_command_result(
-                                status.code(),
-                                signal,
-                                false,
-                                &session.stdout_path,
-                                &session.stderr_path,
-                            );
-                            return Ok(remember_finished(
-                                session_id,
-                                command_result_json(&session.command, Ok(result)),
-                            ));
+                        if let Some(result) = settle_session(&mut sessions, session_id)? {
+                            return Ok(result);
                         }
                         return Err(error.to_string());
                     }
-                    wrote_stdin = true;
+                }
+                // Letting go of the pipe's end is the end of the command's
+                // input: `cat > file` writes the file and exits.
+                if close {
+                    session.stdin = None;
                 }
             }
         }
@@ -1802,6 +1823,7 @@ fn poll_or_write_session(
                 "command": session.command,
                 "session_id": session_id,
                 "running": true,
+                "stdin_closed": session.stdin.is_none(),
                 "stdout": stdout,
                 "stderr": stderr,
                 "truncated": stdout_truncated || stderr_truncated,
@@ -1809,6 +1831,67 @@ fn poll_or_write_session(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Takes a background command out of `sessions` once it has exited, or
+/// has passed its timeout and is ended here, and returns its final result
+/// (kept for later polls, `remember_finished`); None while it runs or when
+/// `sessions` does not hold it.
+fn settle_session(
+    sessions: &mut HashMap<u64, ShellSession>,
+    session_id: u64,
+) -> Result<Option<Value>, String> {
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return Ok(None);
+    };
+    let (timed_out, code, signal) = match session
+        .child
+        .try_wait()
+        .map_err(|error| error.to_string())?
+    {
+        Some(status) => (false, status.code(), status_signal(&status)),
+        None if session.started.elapsed().unwrap_or_default() >= session.timeout => {
+            kill_child(&mut session.child);
+            (true, None, None)
+        }
+        None => return Ok(None),
+    };
+    let session = sessions.remove(&session_id).expect("session exists");
+    let result = collect_command_result(
+        code,
+        signal,
+        timed_out,
+        &session.stdout_path,
+        &session.stderr_path,
+    );
+    Ok(Some(remember_finished(
+        session_id,
+        command_result_json(&session.command, Ok(result)),
+    )))
+}
+
+/// Watches a background command: once it exits, or at its timeout (ending
+/// it then), it is settled whether or not anyone polls it, so a hung one
+/// does not run on unseen. Stops when the session is gone (polled to its
+/// end, stopped, or its engine closed).
+fn end_session_at_timeout(session_id: u64, started: SystemTime, timeout: Duration) {
+    let watch = move || loop {
+        let left = timeout.saturating_sub(started.elapsed().unwrap_or_default());
+        thread::sleep(left.min(Duration::from_secs(1)));
+        let Ok(mut sessions) = shell_sessions().lock() else {
+            return;
+        };
+        if !sessions.contains_key(&session_id) {
+            return;
+        }
+        match settle_session(&mut sessions, session_id) {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => return,
+        }
+    };
+    let _ = thread::Builder::new()
+        .name(format!("shell-session-{session_id}"))
+        .spawn(watch);
 }
 
 fn collect_command_result(
@@ -1862,6 +1945,9 @@ pub(crate) fn kill_child(child: &mut Child) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        // Should taskkill fail, the child itself still ends: a wait after
+        // this must not block for good.
+        let _ = child.kill();
     }
     #[cfg(not(windows))]
     {
@@ -2461,6 +2547,7 @@ fn apply_patch(
     let check = run_command_events(
         "git",
         &["apply", "--check", "--whitespace=nowarn", "-"],
+        "git apply --check --whitespace=nowarn -",
         &[],
         Some(patch),
         cwd,
@@ -2480,6 +2567,7 @@ fn apply_patch(
             let result = run_command_events(
                 "git",
                 &["apply", "--whitespace=nowarn", "-"],
+                "git apply --whitespace=nowarn -",
                 &[],
                 Some(patch),
                 cwd,
@@ -3166,7 +3254,7 @@ impl ToolState {
     }
 
     /// A background shell of this engine's is still running (one past its
-    /// timeout is not: the next poll ends it).
+    /// timeout is not: its watcher is ending it, `end_session_at_timeout`).
     pub fn has_running_shell(&self) -> bool {
         let owned: Vec<u64> = match self.inner.lock() {
             Ok(inner) => inner.shells.iter().copied().collect(),
@@ -4110,13 +4198,27 @@ fn run_command(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<CommandResult, String> {
-    run_command_events(program, args, &[], None, cwd, timeout, &mut |_| Ok(()))
+    let display = command_display(program, args);
+    run_command_events(
+        program,
+        args,
+        &display,
+        &[],
+        None,
+        cwd,
+        timeout,
+        &mut |_| Ok(()),
+    )
 }
 
-/// Runs `program` with `env` added to this process's environment.
+/// Runs `program` with `env` added to this process's environment. Its first
+/// update, `started: <display>`, names what runs: for `bash` the model's
+/// command, not the shell's command line.
+#[allow(clippy::too_many_arguments)]
 fn run_command_events(
     program: &str,
     args: &[&str],
+    display: &str,
     env: &[(std::ffi::OsString, std::ffi::OsString)],
     stdin: Option<&str>,
     cwd: &Path,
@@ -4161,10 +4263,7 @@ fn run_command_events(
     let started = SystemTime::now();
     let mut last_update = started;
     let mut timed_out = false;
-    if let Err(error) = emit(ToolExecutionEvent::Update(format!(
-        "started: {}",
-        command_display(program, args)
-    ))) {
+    if let Err(error) = emit(ToolExecutionEvent::Update(format!("started: {display}"))) {
         abort_command(&mut child, &stdout_path, &stderr_path);
         return Err(error);
     }
@@ -5879,8 +5978,120 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(value["exit_code"], 0);
         assert!(value["stdout"].as_str().unwrap().contains("hello"));
-        assert!(updates.iter().any(|update| update.contains("started:")));
+        // The first update names the model's command, not the shell's
+        // command line (a client shows it while the command runs).
+        assert_eq!(updates[0], "started: echo hello");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bash_timeouts_are_capped_and_large_ones_read_as_milliseconds() {
+        let secs = |requested: Option<u64>, background: bool| {
+            command_timeout(requested, background).as_secs()
+        };
+        // A command that holds the turn: seconds, at most ten minutes.
+        assert_eq!(secs(None, false), 60);
+        assert_eq!(secs(Some(30), false), 30);
+        assert_eq!(secs(Some(0), false), 1);
+        assert_eq!(secs(Some(900), false), 600);
+        // Claude Code's Bash takes milliseconds: 120000 is two minutes, not
+        // 33 hours.
+        assert_eq!(secs(Some(120_000), false), 120);
+        assert_eq!(secs(Some(10_000), false), 10);
+        assert_eq!(secs(Some(3_600_000), false), 600);
+        assert_eq!(secs(Some(u64::MAX), false), 600);
+        // In the background: an hour unless set, at most a day.
+        assert_eq!(secs(None, true), 3_600);
+        assert_eq!(secs(Some(7_200), true), 7_200);
+        assert_eq!(secs(Some(u64::MAX), true), 86_400);
+    }
+
+    #[test]
+    fn a_background_command_ends_at_its_timeout_without_a_poll() {
+        let dir = test_dir("bash-session-timeout");
+        fs::create_dir_all(&dir).unwrap();
+        let owner = ToolState::default();
+        let call = |name: &str, args: Value| -> Value {
+            let output =
+                run_tool_with_events(name, &args.to_string(), &dir, &[], &owner, |_| Ok(())).output;
+            serde_json::from_str(&output).unwrap()
+        };
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 60"
+        } else {
+            "sleep 60"
+        };
+        let started = call(
+            "bash",
+            json!({ "command": command, "timeout": 1, "yield_time_ms": 10 }),
+        );
+        let session_id = started["session_id"].as_u64().expect("still running");
+
+        // Nobody polls: the command is ended at its timeout all the same.
+        let deadline = SystemTime::now() + Duration::from_secs(15);
+        while owner.has_live_shells() && SystemTime::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!owner.has_live_shells(), "still running past its timeout");
+        assert!(!owner.has_running_shell());
+
+        // A later poll gets its result.
+        let result = call(
+            "write_stdin",
+            json!({ "session_id": session_id, "yield_time_ms": 10 }),
+        );
+        assert_eq!(result["timed_out"], true, "{result}");
+        assert_eq!(result["running"], false, "{result}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn closing_stdin_lets_a_command_reading_to_the_end_finish() {
+        // `cat > file` fed through write_stdin, ended with close_stdin or a
+        // trailing Ctrl-D, as a terminal would.
+        let command = if cfg!(windows) {
+            "[Console]::In.ReadToEnd() | Set-Content -NoNewline out.txt"
+        } else {
+            "cat > out.txt"
+        };
+        for (label, input) in [
+            ("close", json!({ "text": "hello\n", "close_stdin": true })),
+            ("ctrl-d", json!({ "text": "hello\n\u{4}" })),
+        ] {
+            let dir = test_dir(&format!("write-stdin-eof-{label}"));
+            fs::create_dir_all(&dir).unwrap();
+            let owner = ToolState::default();
+            let call = |name: &str, args: Value| -> Value {
+                let output =
+                    run_tool_with_events(name, &args.to_string(), &dir, &[], &owner, |_| Ok(()))
+                        .output;
+                serde_json::from_str(&output).unwrap()
+            };
+            let started = call(
+                "bash",
+                json!({ "command": command, "timeout": 30, "yield_time_ms": 10 }),
+            );
+            let session_id = started["session_id"].as_u64().expect("waits for input");
+
+            let mut args = input;
+            args["session_id"] = json!(session_id);
+            args["yield_time_ms"] = json!(5_000);
+            let mut result = call("write_stdin", args);
+            for _ in 0..20 {
+                if result["running"] != true {
+                    break;
+                }
+                result = call(
+                    "write_stdin",
+                    json!({ "session_id": session_id, "yield_time_ms": 500 }),
+                );
+            }
+            assert_eq!(result["exit_code"], 0, "{label}: {result}");
+            assert_eq!(result["timed_out"], false, "{label}: {result}");
+            let written = fs::read_to_string(dir.join("out.txt")).unwrap();
+            assert_eq!(written.replace("\r\n", "\n"), "hello\n", "{label}");
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
