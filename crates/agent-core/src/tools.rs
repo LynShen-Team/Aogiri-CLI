@@ -668,6 +668,11 @@ fn hashline_edit_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
+    // Nothing at the path yet: the edits' lines make a new file. A file that
+    // exists keeps the rule: read it first, edit it by its anchors.
+    if fs::symlink_metadata(&path).is_err() {
+        return create_with_hashline_edits(cwd, &path, raw_edits, state);
+    }
     if let Some(error) = unread_or_stale_error(
         state,
         &path,
@@ -710,6 +715,74 @@ fn hashline_edit_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
                 "path": path.display().to_string(),
                 "edits": raw_edits.len(),
                 "written_bytes": output.len(),
+                "diff": diff.unwrap_or_default(),
+                "anchors": anchors.unwrap_or_default(),
+            })
+        }
+        Err(error) => json!({ "path": path.display().to_string(), "error": error.to_string() }),
+    }
+}
+
+/// The file hashline_edit makes at a path with nothing there yet: the lines
+/// of its edits, in call order, each an append or prepend without anchors
+/// (a missing file has none to edit by).
+pub(crate) fn hashline_new_file(raw_edits: &[Value]) -> Result<String, String> {
+    let edits = parse_hashline_edits(raw_edits)?;
+    if edits
+        .iter()
+        .any(|edit| edit.op == "replace" || edit.pos.is_some())
+    {
+        return Err("[E_NO_FILE] This file does not exist, so it has no anchors to edit by. To create it, send its lines as an append edit without pos; to edit another file, check the path.".to_string());
+    }
+    let mut content = edits
+        .iter()
+        .flat_map(|edit| edit.lines.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    content.push('\n');
+    Ok(content)
+}
+
+/// hashline_edit at a path with nothing there: writes the new file
+/// (`hashline_new_file`), never over one that appeared meanwhile.
+fn create_with_hashline_edits(
+    cwd: &Path,
+    path: &Path,
+    raw_edits: &[Value],
+    state: &ToolState,
+) -> Value {
+    let content = match hashline_new_file(raw_edits) {
+        Ok(content) => content,
+        Err(error) => return json!({ "path": path.display().to_string(), "error": error }),
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() });
+        }
+    }
+    let target = path.to_path_buf();
+    let checkpoint = begin_checkpoint(
+        cwd,
+        "auto-hashline-edit",
+        std::slice::from_ref(&target),
+        state,
+    );
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(content.as_bytes()));
+    let _ = checkpoint.and_then(PendingCheckpoint::finish);
+    match written {
+        Ok(()) => {
+            state.mark_read(path);
+            let diff = unified_diff_for_file(cwd, path, "", &content);
+            let anchors = post_edit_anchor_block(&content, 1, content.lines().count());
+            json!({
+                "path": path.display().to_string(),
+                "created": true,
+                "edits": raw_edits.len(),
+                "written_bytes": content.len(),
                 "diff": diff.unwrap_or_default(),
                 "anchors": anchors.unwrap_or_default(),
             })
@@ -5597,6 +5670,104 @@ mod tests {
         assert!(value["anchors"].as_str().unwrap().contains("2#"));
         assert!(value["diff"].as_str().unwrap().contains("-beta"));
         assert!(value["diff"].as_str().unwrap().contains("+BETA"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_edit_creates_a_missing_file_from_its_appends() {
+        let dir = test_dir("hashline-create");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("src").join("new.txt");
+        let state = ToolState::default();
+        let call = |args: Value| -> Value {
+            let output = run_tool_with_events(
+                "hashline_edit",
+                &args.to_string(),
+                &dir,
+                &[],
+                &state,
+                |_| Ok(()),
+            )
+            .output;
+            serde_json::from_str(&output).unwrap()
+        };
+
+        // No read first and no anchors: the lines become the file, in call
+        // order, in a directory made for it.
+        let created = call(json!({
+            "path": path,
+            "edits": [
+                { "op": "append", "lines": ["alpha", "beta"] },
+                { "op": "append", "lines": "gamma\n" }
+            ]
+        }));
+        assert!(created.get("error").is_none(), "{created}");
+        assert_eq!(created["created"], true);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nbeta\ngamma\n");
+        assert!(created["diff"].as_str().unwrap().contains("+gamma"));
+        assert!(created["anchors"].as_str().unwrap().contains("3#"));
+
+        // It counts as read: the next edit goes by the anchors it returned.
+        let gamma = format_hashline(3, "gamma");
+        let anchor = gamma.split_once(':').unwrap().0;
+        let edited = call(json!({
+            "path": path,
+            "edits": [{ "op": "replace", "pos": anchor, "lines": ["GAMMA"] }]
+        }));
+        assert!(edited.get("error").is_none(), "{edited}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nbeta\nGAMMA\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_edit_never_creates_over_an_existing_file_or_by_anchors() {
+        let dir = test_dir("hashline-create-guard");
+        fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("existing.txt");
+        fs::write(&existing, "keep\n").unwrap();
+        let state = ToolState::default();
+        let call = |args: Value| -> Value {
+            let output = run_tool_with_events(
+                "hashline_edit",
+                &args.to_string(),
+                &dir,
+                &[],
+                &state,
+                |_| Ok(()),
+            )
+            .output;
+            serde_json::from_str(&output).unwrap()
+        };
+
+        // An existing file still needs a read first: an append without pos
+        // does not replace or extend it unread.
+        let unread = call(json!({
+            "path": existing,
+            "edits": [{ "op": "append", "lines": ["new"] }]
+        }));
+        assert!(
+            unread["error"]
+                .as_str()
+                .unwrap()
+                .contains("requires reading this file first"),
+            "{unread}"
+        );
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "keep\n");
+
+        // A missing file has no anchors: replace (or any pos) is refused and
+        // nothing is created.
+        let missing = dir.join("missing.txt");
+        for edit in [
+            json!({ "op": "replace", "pos": "1#ZZ", "lines": ["x"] }),
+            json!({ "op": "append", "pos": "1#ZZ", "lines": ["x"] }),
+        ] {
+            let refused = call(json!({ "path": missing, "edits": [edit] }));
+            assert!(
+                refused["error"].as_str().unwrap().contains("[E_NO_FILE]"),
+                "{refused}"
+            );
+            assert!(!missing.exists());
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

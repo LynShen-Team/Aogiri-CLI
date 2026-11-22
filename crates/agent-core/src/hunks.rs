@@ -285,6 +285,15 @@ fn plan_hashline_edit(args: &Value, cwd: &Path) -> Option<Vec<HunkView>> {
     }
     // Paths outside the workspace get no preview; the tool itself rejects them.
     let path = tools::workspace_path(cwd, path).ok()?;
+    // A new file: each edit shows the lines it adds (`hashline_new_file`).
+    if fs::symlink_metadata(&path).is_err() {
+        let mut views = Vec::new();
+        for (index, edit) in edits.iter().enumerate() {
+            let created = tools::hashline_new_file(std::slice::from_ref(edit)).ok()?;
+            views.push(single_edit_hunk(cwd, &path, "", &created, index)?);
+        }
+        return Some(views);
+    }
     let original = fs::read_to_string(&path).ok()?;
 
     let mut views = Vec::new();
@@ -703,6 +712,27 @@ diff --git a/sample.txt b/sample.txt
         let filtered = filter_edit_call("hashline_edit", &args, &["f0h1".to_string()]).unwrap();
         assert_eq!(filtered.applied, ["f0h1"]);
         assert_eq!(filtered.rejected, ["f0h2"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_edit_creating_a_file_previews_the_lines_each_edit_adds() {
+        let dir = test_dir("hashline-plan-new");
+        let args = json!({
+            "path": "src/new.txt",
+            "edits": [
+                { "op": "append", "lines": ["alpha"] },
+                { "op": "append", "lines": ["beta"] },
+            ],
+        })
+        .to_string();
+
+        let hunks = plan_edit_hunks("hashline_edit", &args, &dir).unwrap();
+        assert_eq!(hunks.len(), 2);
+        assert!(hunks[0].lines.contains(&"+alpha".to_string()));
+        assert!(hunks[1].lines.contains(&"+beta".to_string()));
+        // Planning writes nothing.
+        assert!(!dir.join("src/new.txt").exists());
         let _ = fs::remove_dir_all(dir);
     }
 

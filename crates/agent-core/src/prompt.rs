@@ -28,8 +28,10 @@ fn tool_guidance(edit_tools: &[String]) -> String {
         " Create new files with write."
     } else if enabled("apply_patch") {
         " Create new files with apply_patch."
+    } else if enabled("hashline_edit") {
+        " Create a new file with hashline_edit: append its lines, without pos."
     } else {
-        " Create new files with bash (for example a heredoc)."
+        " Create new files with a shell command."
     });
     guidance
 }
@@ -1007,8 +1009,16 @@ mod tests {
         let prompt =
             build_system_prompt("Base", &coding_context(crate::config::default_edit_tools()));
         assert!(prompt.contains("Edit files with hashline_edit."));
-        assert!(prompt.contains("Create new files with bash"));
-        for disabled in ["str_replace", "apply_patch", "with write"] {
+        // New files too: not through the shell (a heredoc means nothing to
+        // PowerShell, and Git Bash took long ones apart).
+        assert!(prompt.contains("Create a new file with hashline_edit"));
+        for disabled in [
+            "str_replace",
+            "apply_patch",
+            "with write",
+            "heredoc",
+            "files with bash",
+        ] {
             assert!(!prompt.contains(disabled), "guidance names {disabled}");
         }
     }
@@ -1024,6 +1034,10 @@ mod tests {
         assert!(prompt.contains("Create new files with write."));
         let patch_only = build_system_prompt("Base", &coding_context(all(&["apply_patch"])));
         assert!(patch_only.contains("Create new files with apply_patch."));
+        // str_replace cannot create a file: the shell can, in its own syntax.
+        let replace_only = build_system_prompt("Base", &coding_context(all(&["str_replace"])));
+        assert!(replace_only.contains("Create new files with a shell command."));
+        assert!(!replace_only.contains("heredoc"));
         let none = build_system_prompt("Base", &coding_context(Vec::new()));
         assert!(none.contains("No file-edit tools are enabled"));
         assert!(!none.contains("Edit files with"));
