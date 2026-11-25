@@ -387,6 +387,9 @@ pub struct AgentCore {
     /// agents started before that are no evidence for them.
     plan_set_back: HashMap<String, u64>,
     mcp: McpManager,
+    /// The provider this session runs on instead of the configured one
+    /// (`set_session_provider`); None: the configured one.
+    session_provider: Option<crate::SessionProvider>,
     /// Version reported in the startup event and used by the update check.
     /// Binaries override it with their own via `with_version`; the default is
     /// the agent-core crate version, which may differ.
@@ -543,6 +546,7 @@ impl AgentCore {
             action_tx,
             action_rx,
             mcp,
+            session_provider: None,
             version: env!("CARGO_PKG_VERSION"),
         })
     }
@@ -564,6 +568,30 @@ impl AgentCore {
 
     pub fn is_chat(&self) -> bool {
         self.chat
+    }
+
+    /// Runs this session on `provider` instead of the configured one (see
+    /// `session_provider`), from its next request: config.json and every
+    /// other session keep theirs. A `/model` it does not serve takes the
+    /// session back to the configured provider (`set_model_config`).
+    pub fn set_session_provider(&mut self, provider: crate::SessionProvider) {
+        self.forget_provider_count();
+        crate::session_provider::apply(&mut self.config, &provider);
+        self.session_provider = Some(provider);
+    }
+
+    /// The provider this session runs on instead of the configured one, with
+    /// the model it is on now.
+    pub fn session_provider(&self) -> Option<&crate::SessionProvider> {
+        self.session_provider.as_ref()
+    }
+
+    /// Back on the configured provider, as config.json has it now.
+    fn leave_session_provider(&mut self) -> io::Result<()> {
+        self.config = Config::load_or_create()?;
+        self.session_provider = None;
+        self.forget_provider_count();
+        Ok(())
     }
 
     /// Runs this engine's shell commands in `sandbox` and checks file writes
@@ -1208,6 +1236,19 @@ impl AgentCore {
             );
         }
 
+        // A sign-in saves this engine's config, and the subagent models are
+        // the account's: on a provider of the session's own, neither is.
+        let saves_account = matches!(command, "/login" | "/login-paste")
+            || (command == "/subagents" && !args.trim().is_empty());
+        if let (true, Some(provider)) = (saves_account, &self.session_provider) {
+            return (
+                false,
+                vec![AgentEvent::Error(format!(
+                    "this conversation runs on {}: {command} works in a conversation on your account",
+                    provider.name
+                ))],
+            );
+        }
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(crate::commands::help_line())],
@@ -1659,7 +1700,10 @@ impl AgentCore {
     /// access token for the lynshen provider, a stored omp OAuth access token
     /// when logged in via the catalog, otherwise the raw provider key.
     fn provider_api_key(&self) -> Option<String> {
-        provider_api_key(&self.config, &self.auth)
+        match &self.session_provider {
+            Some(provider) => Some(provider.api_key.clone()),
+            None => provider_api_key(&self.config, &self.auth),
+        }
     }
 
     fn model_headers(&self) -> HashMap<String, Vec<(String, String)>> {
@@ -2779,6 +2823,9 @@ impl AgentCore {
         // groups in config.json while engines run. An unreadable file keeps
         // the values this engine already has.
         let _ = self.config.reload_live_settings();
+        if let Some(provider) = &self.session_provider {
+            crate::session_provider::fence(&mut self.config, provider);
+        }
         let model_headers = self.model_headers();
         let images = crate::images::ImageTools::from_config(
             &self.config,
@@ -6394,7 +6441,7 @@ impl AgentCore {
     fn reload_model_list(&mut self) {
         if let Ok(disk) = Config::load_or_create() {
             self.config.context_window_overrides = disk.context_window_overrides.clone();
-            if disk.provider == self.config.provider {
+            if disk.provider == self.config.provider && self.session_provider.is_none() {
                 self.config.models = disk.models;
                 self.config.lynshen_models = disk.lynshen_models;
                 self.config.lynshen_groups = disk.lynshen_groups;
@@ -6419,12 +6466,35 @@ impl AgentCore {
         if model.trim().is_empty() {
             return vec![AgentEvent::Error("model cannot be empty".to_string())];
         }
+        // A model the session's own provider does not serve: the user picked
+        // one of the account's, so the conversation goes back to it.
+        if self
+            .session_provider
+            .as_ref()
+            .is_some_and(|provider| !provider.models.contains(&model))
+        {
+            if let Err(error) = self.leave_session_provider() {
+                return vec![AgentEvent::Error(format!("failed to load config: {error}"))];
+            }
+        }
         let efforts = self.reasoning_efforts_for_model(&model);
         let (effort, note) = match model_effort(&model, &reasoning_effort, &efforts) {
             Ok(resolved) => resolved,
             Err(error) => return vec![AgentEvent::Error(error)],
         };
         self.forget_provider_count();
+        // On the session's own provider: this conversation only, config.json
+        // keeps the account's model.
+        if let Some(provider) = self.session_provider.as_mut() {
+            provider.model = model.clone();
+            self.config.model = model;
+            self.config.reasoning_effort = effort;
+            return note
+                .map(AgentEvent::Info)
+                .into_iter()
+                .chain([self.model_status_event()])
+                .collect();
+        }
         match self.change_config(|config| {
             config.model = model.clone();
             config.reasoning_effort = effort.clone();

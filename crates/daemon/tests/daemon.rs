@@ -85,6 +85,7 @@ impl Client {
             "acp_presets",
             "term_attach",
             "schedule_runs",
+            "session_provider",
         ] {
             assert!(
                 features.as_array().unwrap().contains(&json!(feature)),
@@ -6063,4 +6064,135 @@ fn an_old_agent_store_loads_and_its_tasks_run() {
         s["last_run"]["status"] == "done"
     });
     assert_eq!(done["next_run_at"], 4102444800u64);
+}
+
+/// A LynShen session on a provider of its own (`session_provider`: the
+/// 赛博鸡蛋 campaign's endpoint and key, as the desktop sends them).
+fn egg_provider(base_url: &str) -> Value {
+    json!({
+        "id": "cyber-egg",
+        "name": "赛博鸡蛋",
+        "base_url": base_url,
+        "protocol": "chat",
+        "api_key": "sk-egg-test-secret",
+        "models": [{ "name": "egg-mini" }, { "name": "egg-pro" }],
+        "model": "egg-pro",
+    })
+}
+
+/// The `model_status` a session's engine reports once `client` watches it.
+fn watched_status(client: &mut Client, session: &str) -> Value {
+    client.send(json!({ "op": "watch", "session": session }));
+    client
+        .until(|frame| frame["type"] == "model_status" && frame["session"] == session)
+        .pop()
+        .unwrap()
+}
+
+fn lynshen_file(name: &str) -> Value {
+    let path = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .join(".lynshen")
+        .join(name);
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Only on the gateway's https host; that session alone, config.json left
+/// as it is; kept when the session reopens (its key in auth.json, never in
+/// the daemon's logs) until a client drops it. No request reaches the
+/// provider: nothing is sent in the session.
+#[test]
+fn a_session_runs_on_its_own_provider_alone_and_keeps_it_when_reopened() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-session-provider");
+    let mut client = Client::connect(&daemon);
+
+    // Off the gateway's https host, or for another engine: refused.
+    for (id, engine, base_url) in [
+        (11, "lynshen", "http://api.lynshen.org/new/v1"),
+        (12, "lynshen", "https://evil.example/new/v1"),
+        (13, "lynshen", "https://api.lynshen.org.evil.example/new/v1"),
+        (14, "claude", "https://api.lynshen.org/new/v1"),
+    ] {
+        client.send(json!({
+            "op": "session_create", "cwd": dir, "engine": engine, "id": id,
+            "options": { "provider": egg_provider(base_url) },
+        }));
+        let reply = client.until(|frame| frame["id"] == id).pop().unwrap();
+        assert_eq!(reply["type"], "error", "{base_url}: {reply}");
+        assert!(!reply.to_string().contains("sk-egg-test-secret"), "{reply}");
+    }
+
+    client.send(json!({
+        "op": "session_create", "cwd": dir, "engine": "lynshen", "id": 15,
+        "options": { "provider": egg_provider("https://api.lynshen.org/new/v1") },
+    }));
+    let created = client.until(|frame| frame["id"] == 15).pop().unwrap();
+    assert_eq!(created["type"], "session_created", "{created}");
+    let egg = created["session"].as_str().unwrap().to_string();
+    let status = watched_status(&mut client, &egg);
+    assert_eq!(status["provider"], "cyber-egg", "{status}");
+    assert_eq!(status["model"], "egg-pro", "{status}");
+
+    // Every other session, and config.json, keep the account's provider.
+    let plain = client.create_session(&dir);
+    let status = watched_status(&mut client, &plain);
+    assert_eq!(status["provider"], "fake", "{status}");
+    assert_eq!(status["model"], "fake-model", "{status}");
+    let config_unchanged = || {
+        let config = lynshen_file("config.json");
+        assert_eq!(config["provider"], "fake", "{config}");
+        assert_eq!(config["model"], "fake-model", "{config}");
+        assert!(!config.to_string().contains("cyber-egg"), "{config}");
+    };
+    config_unchanged();
+
+    // A model of its own provider: this conversation only.
+    client.send(json!({ "op": "command", "session": egg, "input": "/model egg-mini" }));
+    client.until(|frame| {
+        frame["type"] == "model_status"
+            && frame["session"] == egg.as_str()
+            && frame["model"] == "egg-mini"
+    });
+    config_unchanged();
+
+    // The key is kept as provider keys are, never in the daemon's logs.
+    let auth = lynshen_file("auth.json");
+    assert_eq!(
+        auth["tool_providers"][format!("session:{egg}")],
+        "sk-egg-test-secret"
+    );
+    let mut logs = String::new();
+    for entry in fs::read_dir(&daemon.state).unwrap().flatten() {
+        logs.push_str(&fs::read_to_string(entry.path()).unwrap_or_default());
+    }
+    assert!(logs.contains("cyber-egg"));
+    assert!(!logs.contains("sk-egg-test-secret"));
+
+    // Reopened by a client that names no provider (a restart, a phone, an
+    // idle close): on the one it kept, on the model it was last on.
+    client.send(json!({ "op": "session_close", "session": egg }));
+    client.until(|frame| frame["type"] == "session_closed" && frame["session"] == egg.as_str());
+    client.send(json!({ "op": "session_open", "session": egg, "id": 16 }));
+    let opened = client.until(|frame| frame["id"] == 16).pop().unwrap();
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    let status = watched_status(&mut client, &egg);
+    assert_eq!(status["provider"], "cyber-egg", "{status}");
+    assert_eq!(status["model"], "egg-mini", "{status}");
+
+    // `null` takes it back to the account's provider, and its key goes.
+    client.send(json!({ "op": "session_close", "session": egg }));
+    client.until(|frame| frame["type"] == "session_closed" && frame["session"] == egg.as_str());
+    client.send(json!({
+        "op": "session_open", "session": egg, "id": 17,
+        "engine": "lynshen", "options": { "provider": null },
+    }));
+    let opened = client.until(|frame| frame["id"] == 17).pop().unwrap();
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    let status = watched_status(&mut client, &egg);
+    assert_eq!(status["provider"], "fake", "{status}");
+    assert!(lynshen_file("auth.json")["tool_providers"]
+        .get(format!("session:{egg}"))
+        .is_none());
+    config_unchanged();
 }

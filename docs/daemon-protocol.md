@@ -236,7 +236,7 @@ handshake with HTTP 401. Local clients read the daemon token from
 Each WebSocket text message is one JSON frame. The daemon first sends:
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files","fork","engine_probe","tool_providers","acp_presets","term_attach","schedule_runs"]}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files","fork","engine_probe","tool_providers","acp_presets","term_attach","schedule_runs","session_provider"]}
 {"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"updated_at":0,"entries":4,"title":"...","archived":false,"open":true,"watchers":0}]}
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
@@ -253,7 +253,9 @@ op, `tool_providers` for custom providers (see "Custom providers"),
 "The ACP client"), `term_attach` for session terminals any client views
 (see "Terminals"; an older daemon gives a session's TUI to the client that
 asked only), `schedule_runs` for scheduled tasks' run records, failures,
-`budget` and `worktree` (see "Scheduled tasks").
+`budget` and `worktree` (see "Scheduled tasks"), `session_provider` for a
+LynShen session on a provider of its own (`options.provider`, see "A
+session's own provider").
 
 ## Replies
 
@@ -347,6 +349,41 @@ every connected client.
 
 `decide_action` (a session op) also works for a session that is closed or
 was hosted before a restart: the daemon reopens it first.
+
+### A session's own provider
+
+`session_create` or `session_open` with `engine: "lynshen"` (or none) and
+`options.provider` runs that LynShen session on a provider of its own, such
+as the 赛博鸡蛋 campaign's endpoint and key, while every other session and
+config.json keep the account's provider (feature `session_provider`):
+
+```json
+{"op":"session_create","cwd":"/p","engine":"lynshen","options":{"provider":{
+  "id":"cyber-egg","name":"赛博鸡蛋","base_url":"https://api.lynshen.org/new/v1",
+  "protocol":"chat","api_key":"…","models":[{"name":"…"}],"model":"…"}}}
+```
+
+- `id`: what the engine reports as its `provider` (`model_status`); not a
+  built-in provider's id. `protocol`: `chat`, `responses` or `anthropic`.
+  `model`: one of `models` (`{name}` each).
+- `base_url` must be https on the host (and port) of the account's gateway,
+  config.json's `lynshen_api_url` (`api.lynshen.org`); anything else is
+  refused, as is a provider for another engine or an agent's session.
+- The session's requests (its turns, subagents, compaction, the safety
+  review) go to that URL with that key. A provider's error reaches the
+  client as it sent it (`LLM API returned HTTP 403: <body>`). The daemon
+  names such a session by its first line, not with the title model.
+- The session keeps it: a `session_open` that names no provider (a phone, a
+  restart, an idle close) runs on it again, one that names another replaces
+  it, and `"provider": null` takes the session back to the account's
+  provider. `/model` with one of its models changes this session only; with
+  a model it does not serve, the session goes back to the account's provider
+  on that model. `/login` and changing `/subagents` are refused in it, and
+  it does not open in the TUI.
+- The record keeps it without the key; the key is in auth.json's
+  `tool_providers` block as `session:<id>`, encrypted when
+  `encrypt_secrets` is on, and never logged. A session whose key is gone
+  does not open rather than run on the account's provider.
 
 ### Forks
 
@@ -582,6 +619,7 @@ clients need nothing engine-specific. `options`:
 | `command`, `args` | ACP: the agent's command line (an agent the desktop registered; local clients only) |
 | `fork` | ACP, `session_create` only: a conversation of the agent's (its own session id) to copy into the new session with `session/fork`; the original stays as it is |
 | `fork_from`, `fork_turns`, `fork_cwd` | `session_create` only: a fork of a LynShen, Claude Code or Codex conversation (see "Forks") |
+| `provider` | LynShen: the provider the session runs on instead of the account's; `null` the account's again (see "A session's own provider") |
 | `acp_agent` | ACP: `{id, name}`, the desktop's registry entry for the agent, kept with the session (`session_list` returns it) |
 | `bin` | Claude Code / Codex: the engine binary to run instead of the one found on `PATH` |
 | `env` | Extra environment variables for the engine process (plain names; no `DYLD_*`/`LD_*`) |

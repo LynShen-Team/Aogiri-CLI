@@ -398,6 +398,7 @@ mod tests {
             worktree: None,
             parent: None,
             tool_provider: None,
+            session_provider: None,
         }
     }
 

@@ -132,6 +132,9 @@ pub struct Options {
     /// Claude / Codex: the app's tools the engine is offered (the ones the
     /// user left on when it started; set by the daemon, never by a client).
     pub app_tools: Vec<&'static str>,
+    /// LynShen: the provider the session runs on instead of the account's
+    /// (`session_provider`), as the client asked.
+    pub provider: crate::session_provider::Request,
 }
 
 impl Options {
@@ -182,6 +185,7 @@ impl Options {
                 .filter(|agent| agent["id"].is_string() && agent["name"].is_string()),
             claude_config: None,
             app_tools: Vec::new(),
+            provider: crate::session_provider::Request::from_options(value),
         }
     }
 

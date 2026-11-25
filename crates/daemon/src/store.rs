@@ -136,6 +136,9 @@ pub struct SessionRecord {
     /// Claude / Codex: the custom provider it last ran on off the LynShen
     /// gateway ("": the tool's own configuration; None: not recorded).
     pub tool_provider: Option<String>,
+    /// LynShen: the provider it runs on instead of the account's, without
+    /// its key (`session_provider::record`).
+    pub session_provider: Option<Value>,
 }
 
 /// A message for an agent: from the user, another agent or a timer.
@@ -311,6 +314,9 @@ impl Store {
             }
             if let Some(provider) = &record.tool_provider {
                 meta["tool_provider"] = json!(provider);
+            }
+            if let Some(provider) = &record.session_provider {
+                meta["session_provider"] = provider.clone();
             }
             if let Some(source) = &record.forked_from {
                 meta["forked_from"] = source.clone();
@@ -491,7 +497,8 @@ impl Store {
     /// `changes` (`title`, `archived`, `hidden`, `group`, `project`; the
     /// daemon also keeps `gateway`, `tool_provider`, an ACP agent's
     /// `conversation`, `acp_agent`, a fork's `forked_from`, a scheduled run's
-    /// `worktree` and a helper's `parent`); fields left out are unchanged, an empty title goes back
+    /// `worktree`, a helper's `parent` and `session_provider`, null to drop
+    /// it); fields left out are unchanged, an empty title goes back
     /// to the engine's label, an empty group to automatic routing and an
     /// empty project to none. False when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
@@ -544,6 +551,13 @@ impl Store {
         }
         if let Some(provider) = changes["tool_provider"].as_str() {
             entry["tool_provider"] = json!(provider);
+            changed = true;
+        }
+        if let Some(provider) = changes
+            .get("session_provider")
+            .filter(|provider| provider.is_object() || provider.is_null())
+        {
+            entry["session_provider"] = provider.clone();
             changed = true;
         }
         if changed {
@@ -617,6 +631,7 @@ impl Store {
                             worktree: None,
                             parent: None,
                             tool_provider: None,
+                            session_provider: None,
                         }
                     });
                     record.closed = false;
@@ -670,6 +685,10 @@ impl Store {
                         }
                         if let Some(provider) = entry["tool_provider"].as_str() {
                             record.tool_provider = Some(provider.to_string());
+                        }
+                        if let Some(provider) = entry.get("session_provider") {
+                            record.session_provider =
+                                Some(provider.clone()).filter(Value::is_object);
                         }
                     }
                 }
