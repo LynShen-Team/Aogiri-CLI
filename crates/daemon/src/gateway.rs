@@ -291,7 +291,15 @@ fn plan_quota_from(reply: &Value) -> Value {
             } else {
                 0.0
             };
-            Some(json!({ "kind": w["kind"], "used_pct": pct.round(), "resets_at": w["resets_at"] }))
+            let mut window =
+                json!({ "kind": w["kind"], "used_pct": pct.round(), "resets_at": w["resets_at"] });
+            // A model-scoped window (the gateway sends `models`, e.g. ["claude-*"] for a
+            // Claude-only weekly window beside the weekly window for every model) keeps
+            // them, so the phone can name it and tell the two "7d" windows apart.
+            if let Some(models) = w["models"].as_array().filter(|models| !models.is_empty()) {
+                window["models"] = Value::Array(models.clone());
+            }
+            Some(window)
         })
         .collect();
     json!({ "type": "plan_quota", "plan": plan["name"], "windows": windows })
@@ -775,6 +783,7 @@ mod tests {
         assert_eq!(quota["plan"], "Sprout");
         assert_eq!(quota["windows"][0]["used_pct"], 25.0);
         assert_eq!(quota["windows"][1]["used_pct"], 100.0);
+        assert!(quota["windows"][0].get("models").is_none());
         assert_eq!(
             super::plan_quota_from(&json!({ "plan": null }))["windows"],
             json!([])
@@ -783,6 +792,18 @@ mod tests {
             super::plan_quota_from(&json!({ "plan": { "active": false } }))["plan"],
             Value::Null
         );
+    }
+
+    #[test]
+    fn plan_quota_keeps_the_models_of_a_scoped_window() {
+        let reply = json!({ "plan": { "name": "Sprout", "windows": [
+            { "kind": "7d", "quota_cny": "23", "used_cny": "10", "resets_at": null },
+            { "kind": "7d", "quota_cny": "11.5", "used_cny": "11.5", "resets_at": null, "models": ["claude-*"] }
+        ] } });
+        let quota = super::plan_quota_from(&reply);
+        assert!(quota["windows"][0].get("models").is_none());
+        assert_eq!(quota["windows"][1]["models"], json!(["claude-*"]));
+        assert_eq!(quota["windows"][1]["used_pct"], 100.0);
     }
 
     use super::*;
