@@ -67,36 +67,37 @@ pub(crate) fn tool_view(name: &str, output: &str, running: bool) -> ToolView {
         .filter(serde_json::Value::is_object);
 
     // `!command` typed by the user: run here, not by the model.
-    if let Some(command) = name.strip_prefix("! ") {
+    let local_command = name.strip_prefix("! ");
+    if let Some(command) = local_command {
         view.arg = first_line(command);
-        match &value {
-            Some(value) => shell_view(&mut view, value, running),
-            None => {
-                view.body = text_lines(output);
-                view.body_mode = BodyMode::Tail;
-            }
-        }
-        return view;
     }
-    if is_shell_tool(name) || name == "write_stdin" {
-        match &value {
-            Some(value) => shell_view(&mut view, value, running),
-            None => {
-                view.body = text_lines(output);
-                view.body_mode = BodyMode::Tail;
-            }
-        }
-        return view;
-    }
-    // Any tool can fail with {"error": "…"}; show the message, not raw JSON.
+    // Any tool can fail with {"error": "…"} (a shell session too); show the
+    // message, not raw JSON.
     if let Some(error) = value.as_ref().and_then(json_error) {
         view.state = ToolState::Failed;
+        if let Some(command) = value
+            .as_ref()
+            .and_then(|value| value.get("command"))
+            .and_then(serde_json::Value::as_str)
+        {
+            view.arg = first_line(command);
+        }
         let mut lines = error.lines();
         view.extra = vec![Span::styled(
             lines.next().unwrap_or_default().to_string(),
             theme::err(),
         )];
         view.body = lines.map(|line| dim_line(line.to_string())).collect();
+        return view;
+    }
+    if local_command.is_some() || is_shell_tool(name) || name == "write_stdin" {
+        match &value {
+            Some(value) => shell_view(&mut view, value, running),
+            None => {
+                view.body = text_lines(output);
+                view.body_mode = BodyMode::Tail;
+            }
+        }
         return view;
     }
     if let Some(value) = &value {

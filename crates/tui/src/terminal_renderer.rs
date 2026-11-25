@@ -813,7 +813,9 @@ mod tests {
         let mut scroll = 3usize;
         let rows = drawn_rows(48, 10, &mut scroll);
         assert!(
-            rows.iter().any(|row| row.contains("已往上翻看")),
+            // A wide character's second cell reads as a space.
+            rows.iter()
+                .any(|row| row.replace(' ', "").contains("已往上翻看")),
             "{rows:?}"
         );
     }

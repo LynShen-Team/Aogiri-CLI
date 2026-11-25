@@ -2486,7 +2486,8 @@ fn content_anchored_layout_puts_the_composer_under_a_short_transcript() {
     assert!(rows[2].starts_with("────"), "{rows:#?}");
     assert!(rows[3].starts_with("  › "), "{rows:#?}");
     assert!(rows[4].starts_with("────"));
-    assert!(rows[5].contains("手动批准"));
+    // A wide character's second cell reads as a space.
+    assert!(rows[5].replace(' ', "").contains("手动批准"), "{rows:#?}");
     assert!(rows[19].trim().is_empty());
 }
 
