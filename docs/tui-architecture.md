@@ -9,7 +9,7 @@ LynShen's TUI is a ratatui application running on the terminal's alternate scree
 1. `AgentCore` produces `AgentEvent`s.
 2. `TuiApp` owns the interactive TUI state and applies those events.
 3. `UiBuilder` converts TUI state into a `UiDocument` (a transcript plus a flat list of control lines).
-4. `TerminalRenderer` owns a `ratatui::Terminal` on the alternate screen. Each draw it splits the screen into regions, paints each region's styled lines into its rect, and draws the chrome (input box border, scrollbar, status bar) with ratatui widgets.
+4. `TerminalRenderer` owns a `ratatui::Terminal` on the alternate screen. Each draw it splits the screen into regions, paints each region's styled lines into its rect, and draws the chrome (the composer's two rules, the scrollbar) itself.
 5. Ratatui diffs the frame buffer against the previous frame and writes only the cells that changed.
 
 This keeps the architecture close to the product model: runtime events in, state update, document build, terminal render.
@@ -21,12 +21,21 @@ The TUI runs on the terminal's **alternate screen** (a ratatui-owned full-screen
 `draw()` splits the frame vertically, bottom-up, so the input and status always fit:
 
 - **transcript** — scrollable history viewport with a `Scrollbar` on its right column; takes the remaining height.
-- **live** — assistant stream, picker, pending messages, and the progress spinner.
-- **input box** — the prompt wrapped in a rounded `Block` border.
-- **candidates** — the slash-command completion list.
-- **status bar** — a single full-width row with a background tint.
+- **live** — pickers and confirmations (approval, trust, plan), pending messages, the progress row and one-line notices.
+- **input box** — the composer between a faint rule above and below it, no side borders. A confirmation takes its place (no `Input` lines are emitted).
+- **candidates** — the `/` command palette, `@` file matches or the `?` shortcut sheet (`Candidate`/`CandidateSelected` lines).
+- **status bar** — one plain row: model and effort, approval mode, branch, context use, balance. Hidden while candidates show.
 
-The renderer derives these regions from the flat `UiDocument.controls` list using the builder's ordering invariants (the status line is last, the completion candidates are the trailing non-input run, the input box is the trailing run of `Input` lines, and everything above is the live region).
+The renderer derives these regions from the flat `UiDocument.controls` list using the builder's ordering invariants (the status line is last, the candidates are the trailing run of candidate kinds, the input box is the trailing run of `Input` lines, and everything above is the live region).
+
+The composer follows the conversation: while the transcript is shorter than the space left, the regions stack from the top with one blank row after the transcript; once it fills the space, the composer sits at the bottom. While the view is scrolled up, the last transcript row says how to get back.
+
+### Look
+
+- **Colours** come from `theme.rs`: text keeps the terminal's own foreground; the brand accent (teal) marks the prompt, the selection and running work; green/red mark additions and deletions (and failures); an attention tone marks what waits on the user. Each role resolves through the colour depth (`NO_COLOR` or `TERM=dumb` → bold/dim/reverse only; 16 named colours; the 256 palette; truecolor, read from `COLORTERM`, `TERM`, `TERM_PROGRAM`, `WT_SESSION`) and the background, queried once at startup with OSC 11 (answered or not, a DA1 request ends the read), else `COLORFGBG`; `LYNSHEN_THEME=dark|light` forces it. Background fills (user turns, diff lines, the selected row, drag selection) are blended from the detected background and only drawn when it is known and the terminal has at least 256 colours.
+- **Words** come from `lang.rs`: Chinese unless the locale is English (`LYNSHEN_LANG=zh|en` wins over `LC_ALL`/`LC_MESSAGES`/`LANG`). Command names, model names and the engine's own messages are not translated; built-in commands get a Chinese description in the palette.
+- **Welcome**: the LynShen mark (two trunks and a light, in quadrant blocks, four rows) beside the name and version, the LynShen account and plan (looked up off the UI thread, `lynshen_agent_core::lynshen_account`), the model, and the folder; below it the `/ @ ! ?` hints. Below 48 columns, or where the console font lacks block elements, only the lines show.
+- **Tool calls** (`tool_preview.rs` → `ToolView`): a status dot (accent while running, dim when done, error tone when failed), a verb, the target and the result on one clickable row; the output below hangs off a `│` rule, folded to its last lines (commands) or first lines (diffs, listings). A click on the row or ctrl+o (all blocks) opens it. Diffs carry line numbers and highlight the changed part of a lone removed/added pair.
 
 ## Entry Point and Runtime Boundary
 
@@ -135,11 +144,14 @@ Handled by `handle_key_at()`.
 Key behaviors include:
 
 - plain text editing
-- multi-line input with `Shift+Enter` or `Ctrl+Enter`
-- slash-command completion via `Tab`, `Up`, `Down`
+- multi-line input with `Shift+Enter`, `Ctrl+Enter` or `Ctrl+J`
+- slash-command palette (fuzzy, `fuzzy.rs`) and `@` file matches via `Tab`, `Up`, `Down`
 - word navigation with `Ctrl`/`Alt` + arrows
+- `Up`/`Down` on the first/last line walk the messages sent from this composer (the draft comes back at the end)
 - `Esc` clears input when idle, or sends `interrupt()` while a turn is running (queued pending messages still start the next turn)
-- `BackTab` cycles reasoning effort for the current model
+- `Ctrl+C` interrupts a running turn, else clears the draft, else asks for a second press within two seconds to quit; `Ctrl+D` quits on an empty, idle composer
+- `Ctrl+O` opens or folds every tool block; `?` on an empty composer opens the shortcut sheet (any key closes it)
+- `BackTab` cycles the approval mode; `Ctrl+T` cycles reasoning effort for the current model
 
 ### 2. Picker mode
 
@@ -153,6 +165,8 @@ Picker mode is used for:
 - fork/delete prompts inside the tree picker
 
 This mode is intentionally modal and simple. Instead of building a general widget system, the app swaps into a dedicated picker state object.
+
+List pickers (model, resume, rewind, login) take a typed filter (fuzzy, matched letters highlighted); the model picker's effort moves with Left/Right or Tab. Confirmations (approval, trust, plan) number their options: a digit picks and confirms. Esc (or Ctrl+C) closes a picker; an approval closed that way is answered "deny".
 
 ## UI Data Model
 
@@ -280,12 +294,14 @@ The rendering pipeline has a few layers.
 - splits the flat `controls` list into regions (`ControlRegions::split`)
 - computes the region rects bottom-up
 - selects the visible window of transcript lines (`visible_window`): the live tail by default, or lifted by the scroll offset, and draws a `Scrollbar`
-- wraps the input region in a rounded `Block` and paints the prompt inside it
+- draws the composer's rules and paints the prompt between them
 - paints the live, candidate, and status regions into their rects
 
 Each region's lines are still styled with ANSI escapes (built by `UiBuilder`/`markdown`/`tool_preview`); `paint_ansi_line` translates those into `ratatui::Buffer` cell styles within a region's rect. Ratatui keeps the previous frame buffer and writes only the cells that changed, so the renderer implements no diffing of its own.
 
 `ProjectedDocument` still exists as a flat projection (transcript plus control lines plus cursor position) but is now used only by tests to assert layout invariants.
+
+With `--features preview`, `preview_support` draws sample scenes (welcome, a working turn, an approval, the palette, the model and session pickers, the shortcut sheet, a narrow terminal) in the dark, light and colourless themes and returns the cells as JSON; `cargo run -p lynshen-tui --example tui_preview --features preview` prints them for screenshots.
 
 ## Rendering Strategy and Performance Choices
 

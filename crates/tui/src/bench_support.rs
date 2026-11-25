@@ -61,16 +61,18 @@ fn bench_input_lines(tick: usize) -> Vec<UiLine> {
 fn build_document(rendered_history_lines: Vec<UiLine>, width: usize, tick: usize) -> UiDocument {
     UiBuilder::new()
         .rendered_history_lines(rendered_history_lines)
-        .input(&bench_input_lines(tick), &[], 0)
+        .input(&bench_input_lines(tick), None)
         .bottom_status(
             BottomStatus {
                 provider: "bench",
                 model: "render-frame",
                 reasoning_effort: "none",
+                approval_mode: "manual",
                 git: None,
                 context_tokens: tick as u64,
                 context_window: 1_000_000,
                 cost: 0.0,
+                balance: None,
             },
             width,
         )

@@ -19,13 +19,14 @@ pub(crate) struct GitStatus {
     pub(crate) dirty: bool,
 }
 
-/// Bottom-bar segment for the git status: `" main"` when clean, `" main*"`
-/// when dirty, empty outside a repository.
-pub(crate) fn format_git_segment(status: Option<&GitStatus>) -> String {
-    match status {
-        Some(status) if status.dirty => format!(" {}*", status.branch),
-        Some(status) => format!(" {}", status.branch),
-        None => String::new(),
+impl GitStatus {
+    /// The status bar's label: `main`, or `main*` with uncommitted changes.
+    pub(crate) fn label(&self) -> String {
+        if self.dirty {
+            format!("{}*", self.branch)
+        } else {
+            self.branch.clone()
+        }
     }
 }
 
@@ -122,14 +123,14 @@ mod tests {
         let status = status_from_outputs("main\n", "", "").unwrap();
         assert_eq!(status.branch, "main");
         assert!(!status.dirty);
-        assert_eq!(format_git_segment(Some(&status)), " main");
+        assert_eq!(status.label(), "main");
     }
 
     #[test]
     fn dirty_branch_gets_an_asterisk() {
         let status = status_from_outputs("feature/x\n", "", " M src/lib.rs\n").unwrap();
         assert!(status.dirty);
-        assert_eq!(format_git_segment(Some(&status)), " feature/x*");
+        assert_eq!(status.label(), "feature/x*");
     }
 
     #[test]
@@ -141,6 +142,5 @@ mod tests {
     #[test]
     fn outside_a_repo_shows_nothing() {
         assert_eq!(status_from_outputs("", "", ""), None);
-        assert_eq!(format_git_segment(None), "");
     }
 }

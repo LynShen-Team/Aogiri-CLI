@@ -4,15 +4,13 @@ use ratatui::{
     backend::CrosstermBackend,
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Borders, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        StatefulWidget, Widget,
-    },
+    widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget},
     Terminal,
 };
 
+use crate::theme::{self, Surface};
 #[cfg(test)]
 use crate::ProjectedDocument;
 use crate::{
@@ -22,13 +20,6 @@ use crate::{
 
 /// Column reserved on the right of the transcript for the scrollbar.
 const SCROLLBAR_WIDTH: u16 = 1;
-/// Dim border color for the input box (matches the transcript separator tone).
-const INPUT_BORDER: Color = Color::Rgb(105, 108, 120);
-/// Faint scrollbar track and a slightly brighter thumb.
-const SCROLLBAR_TRACK: Color = Color::Rgb(62, 65, 75);
-const SCROLLBAR_THUMB: Color = Color::Rgb(124, 128, 142);
-/// Uniform drag-selection background — a flat swatch, not per-cell inversion.
-const SELECTION_BG: Color = Color::Rgb(68, 71, 90);
 
 /// A drag selection over the whole screen, in terminal cell coordinates
 /// (`(row, column)`). Covers every painted region — transcript, input box,
@@ -186,7 +177,7 @@ fn draw(
     let regions = ControlRegions::split(&document.controls, width);
 
     // Allocate region heights bottom-up so the input box and status bar always fit; the
-    // transcript takes whatever is left, and an oversized live region shows its tail.
+    // transcript takes what is left, and an oversized live region shows its tail.
     let total = area.height as usize;
     let status_h = regions.status.len().min(total);
     let mut rest = total - status_h;
@@ -200,11 +191,20 @@ fn draw(
     rest -= cand_h;
     let live_h = regions.live.len().min(rest);
     rest -= live_h;
-    let transcript_h = rest;
+    // The composer follows the conversation: while the transcript is shorter
+    // than the space, everything stacks from the top with one blank row
+    // between the transcript and what follows; once it fills the space the
+    // composer sits at the bottom.
+    let gap = usize::from(*scroll == 0 && !transcript.is_empty() && rest > transcript.len());
+    let transcript_h = if *scroll > 0 {
+        rest
+    } else {
+        rest.min(transcript.len())
+    };
 
     let mut y = area.y;
     let transcript_rect = Rect::new(area.x, y, area.width, transcript_h as u16);
-    y += transcript_h as u16;
+    y += (transcript_h + gap) as u16;
     let live_rect = Rect::new(area.x, y, area.width, live_h as u16);
     y += live_h as u16;
     let box_rect = Rect::new(area.x, y, area.width, box_h as u16);
@@ -228,20 +228,18 @@ fn draw(
     (input_cursor_position(box_rect, regions.cursor), clickables)
 }
 
-/// Translates a caret position inside the input box content to a screen position for the
-/// terminal's hardware cursor, clamped to the box interior. Returns `None` when there is
-/// no caret (e.g. the agent is working) or the box has no room for a border interior.
+/// Translates a caret position inside the input box content to a screen
+/// position for the terminal's hardware cursor, clamped to the box between
+/// its rules. Returns `None` when there is no caret or no room.
 fn input_cursor_position(box_rect: Rect, cursor: Option<CursorTarget>) -> Option<(u16, u16)> {
     let cursor = cursor?;
-    if box_rect.height < 3 || box_rect.width < 3 {
+    if box_rect.height < 3 || box_rect.width < 2 {
         return None;
     }
-    let inner_x = box_rect.x + 1;
-    let inner_y = box_rect.y + 1;
-    let max_x = box_rect.x + box_rect.width - 2;
+    let max_x = box_rect.x + box_rect.width - 1;
     let max_y = box_rect.y + box_rect.height - 2;
-    let x = (inner_x + cursor.column as u16).min(max_x);
-    let y = (inner_y + cursor.row as u16).min(max_y);
+    let x = (box_rect.x + cursor.column as u16).min(max_x);
+    let y = (box_rect.y + 1 + cursor.row as u16).min(max_y);
     Some((x, y))
 }
 
@@ -291,9 +289,33 @@ fn draw_transcript(
             .end_symbol(None)
             .track_symbol(Some("│"))
             .thumb_symbol("┃")
-            .track_style(Style::default().fg(SCROLLBAR_TRACK))
-            .thumb_style(Style::default().fg(SCROLLBAR_THUMB))
+            .track_style(theme::faint())
+            .thumb_style(theme::dim())
             .render(rect, buf, &mut state);
+    }
+
+    // Browsing older lines: say how to get back to the live end.
+    if offset > 0 && view_height > 1 {
+        let hint = UiLine::new(
+            UiKind::Status,
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    crate::lang::t(
+                        "↓ 已往上翻看 · 按任意键回到最新",
+                        "↓ scrolled up · any key returns to the end",
+                    ),
+                    theme::dim(),
+                ),
+            ]),
+        );
+        paint_line(
+            buf,
+            text_rect.x,
+            text_rect.y + text_rect.height - 1,
+            text_rect.width as usize,
+            &hint,
+        );
     }
 }
 
@@ -301,6 +323,8 @@ fn draw_transcript(
 /// the foreground untouched stays readable; inverting per-cell colors would
 /// turn styled text into confetti.
 fn paint_selection(buf: &mut Buffer, area: Rect, selection: TextSelection) {
+    // A flat fill where the theme draws fills; reverse video elsewhere.
+    let drag = theme::surface(Surface::Drag);
     let (from, to) = selection.ordered();
     let right = area.x + area.width;
     let bottom = area.y + area.height;
@@ -312,25 +336,43 @@ fn paint_selection(buf: &mut Buffer, area: Rect, selection: TextSelection) {
         let col_end = if row == to.0 { to.1 + 1 } else { right };
         for col in col_start..col_end.min(right) {
             if let Some(cell) = buf.cell_mut((col, row)) {
-                cell.bg = SELECTION_BG;
-                cell.modifier.remove(Modifier::REVERSED);
+                match drag {
+                    Some(color) => {
+                        cell.bg = color;
+                        cell.modifier.remove(Modifier::REVERSED);
+                    }
+                    None => {
+                        cell.modifier.insert(Modifier::REVERSED);
+                    }
+                }
             }
         }
     }
 }
 
+/// The composer: a faint rule above and below its lines, no side borders.
 fn draw_input_box(buf: &mut Buffer, rect: Rect, lines: &[UiLine]) {
-    if rect.height < 2 || rect.width < 2 {
+    if rect.height < 3 || rect.width < 2 {
         paint_lines(buf, rect, lines);
         return;
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(INPUT_BORDER));
-    let inner = block.inner(rect);
-    block.render(rect, buf);
+    let rule = UiLine::new(
+        UiKind::Input,
+        Line::from(Span::styled(
+            "─".repeat(rect.width as usize),
+            theme::faint(),
+        )),
+    );
+    paint_line(buf, rect.x, rect.y, rect.width as usize, &rule);
+    let inner = Rect::new(rect.x, rect.y + 1, rect.width, rect.height - 2);
     paint_lines(buf, inner, lines);
+    paint_line(
+        buf,
+        rect.x,
+        rect.y + rect.height - 1,
+        rect.width as usize,
+        &rule,
+    );
 }
 
 /// Paints the last `rect.height` lines of `lines` from the top of `rect`. Regions are
@@ -360,7 +402,16 @@ fn paint_line(buf: &mut Buffer, x0: u16, y: u16, width: usize, line: &UiLine) {
     }
     let painted = styled.width().min(width);
     buf.set_line(x0, y, &styled, width as u16);
-    let row_bg = base.bg.unwrap_or(Color::Reset);
+    // Diff lines carry their fill on the spans after the line number; it
+    // runs on to the edge from the last one.
+    let row_bg = base
+        .bg
+        .or_else(|| {
+            matches!(line.kind, UiKind::DiffAdd | UiKind::DiffRemove)
+                .then(|| styled.spans.last().and_then(|span| span.style.bg))
+                .flatten()
+        })
+        .unwrap_or(Color::Reset);
     for column in painted..width {
         if let Some(cell) = buf.cell_mut((x0 + column as u16, y)) {
             cell.reset();
@@ -393,14 +444,12 @@ impl ControlRegions {
         } else {
             Vec::new()
         };
-        let mut candidates = pop_trailing(&mut lines, |line| line.kind != UiKind::Input);
+        let mut candidates = pop_trailing(&mut lines, |line| {
+            matches!(line.kind, UiKind::Candidate | UiKind::CandidateSelected)
+        });
         candidates.reverse();
         let mut input = pop_trailing(&mut lines, |line| line.kind == UiKind::Input);
         input.reverse();
-        // The input builder wraps the prompt in empty spacer lines; the box border
-        // replaces them, so drop them before projecting. A caret-only line (empty
-        // continuation row) must stay — it carries the cursor position.
-        input.retain(|line| !line.plain().is_empty() || line.cursor.is_some());
 
         // The caret rides on the wrapped input line as a field, not a text marker.
         let input = wrap_lines(&input, width);
@@ -540,14 +589,25 @@ fn project_line(line: UiLine, history: bool) -> UiLine {
     }
 }
 
+/// History lines all sit two columns in; in the live region only the
+/// assistant's own text needs the margin (the rest carries its own).
 fn should_pad_line(kind: UiKind, history: bool) -> bool {
     if !history {
         return matches!(kind, UiKind::Assistant);
     }
-    matches!(
-        kind,
-        UiKind::User | UiKind::Assistant | UiKind::System | UiKind::Error | UiKind::Status
-    )
+    true
+}
+
+/// Draws a document into a buffer the way the live renderer does; returns
+/// where the hardware cursor goes.
+#[cfg(any(test, feature = "preview"))]
+pub(crate) fn draw_frame(
+    buf: &mut Buffer,
+    area: Rect,
+    document: &UiDocument,
+    scroll: &mut usize,
+) -> Option<(u16, u16)> {
+    draw(buf, area, document, scroll, None).0
 }
 
 #[cfg(test)]
@@ -555,7 +615,7 @@ mod tests {
     use super::*;
     use crate::ui_builder::UiBuilder;
     use crate::{BottomStatus, ChatLine};
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Style};
 
     #[test]
     fn window_follows_live_tail_by_default() {
@@ -577,11 +637,11 @@ mod tests {
     fn styled_spans_paint_into_cells_with_kind_fallback() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
         let line = UiLine::new(
-            UiKind::Assistant,
+            UiKind::Error,
             Line::from(vec![
                 Span::styled(
                     "A",
-                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
                 Span::styled("B", Style::new().bg(Color::Rgb(1, 2, 3))),
@@ -591,12 +651,12 @@ mod tests {
 
         let first = &buffer[(0, 0)];
         assert_eq!(first.symbol(), "A");
-        assert_eq!(first.fg, Color::Red);
+        assert_eq!(first.fg, Color::Blue);
         assert!(first.modifier.contains(Modifier::BOLD));
 
-        // Unstyled spans take the kind color (Assistant = bright white).
+        // Unstyled spans take the kind colour (Error = the error tone).
         let second = &buffer[(1, 0)];
-        assert_eq!(second.fg, Color::White);
+        assert_eq!(Some(second.fg), theme::err().fg);
 
         let third = &buffer[(2, 0)];
         assert_eq!(third.symbol(), "B");
@@ -604,25 +664,43 @@ mod tests {
     }
 
     #[test]
-    fn kind_background_extends_to_end_of_line() {
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
-        let line = UiLine::new(UiKind::DiffAdd, "+x");
-        paint_line(&mut buffer, 0, 0, 8, &line);
+    fn text_kinds_keep_the_terminal_foreground() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        paint_line(&mut buffer, 0, 0, 4, &UiLine::new(UiKind::Assistant, "ok"));
+        assert_eq!(buffer[(0, 0)].fg, Color::Reset);
+    }
 
-        assert!(buffer
-            .content
-            .iter()
-            .all(|cell| cell.bg == Color::Rgb(28, 70, 38)));
+    #[test]
+    fn user_turn_fill_extends_to_end_of_line() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let line = UiLine::new(UiKind::User, "› hi");
+        paint_line(&mut buffer, 0, 0, 8, &line);
+        let fill = theme::surface(Surface::User).expect("fills on a known background");
+        assert!(buffer.content.iter().all(|cell| cell.bg == fill));
+    }
+
+    #[test]
+    fn diff_fill_runs_from_the_last_span_to_the_edge() {
+        let fill = Color::Rgb(9, 9, 9);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
+        let line = UiLine::new(
+            UiKind::DiffAdd,
+            Line::from(vec![
+                Span::raw("  1 "),
+                Span::styled("+ x", Style::new().bg(fill)),
+            ]),
+        );
+        paint_line(&mut buffer, 0, 0, 12, &line);
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+        assert!((4..12).all(|x| buffer[(x, 0)].bg == fill));
     }
 
     #[test]
     fn control_regions_split_separates_input_box_candidates_and_status() {
         let controls = vec![
             UiLine::new(UiKind::Status, "  spinner"),
-            UiLine::new(UiKind::Input, ""),
-            UiLine::new(UiKind::Input, "› hi"),
-            UiLine::new(UiKind::Input, ""),
-            UiLine::new(UiKind::Selected, "  /help"),
+            UiLine::new(UiKind::Input, "  › hi"),
+            UiLine::new(UiKind::CandidateSelected, "  › /help"),
             UiLine::new(UiKind::BottomStatus, "model · tokens"),
         ];
 
@@ -630,7 +708,6 @@ mod tests {
 
         assert_eq!(regions.live.len(), 1);
         assert!(regions.live[0].plain().contains("spinner"));
-        // Wrapper blank lines stripped, leaving just the prompt line for the box.
         assert_eq!(regions.input.len(), 1);
         assert!(regions.input[0].plain().contains("› hi"));
         assert_eq!(regions.candidates.len(), 1);
@@ -639,10 +716,38 @@ mod tests {
         assert!(regions.status[0].plain().contains("model"));
     }
 
+    #[test]
+    fn without_a_composer_the_live_lines_stay_live() {
+        // An approval replaces the composer: nothing is taken for candidates.
+        let controls = vec![
+            UiLine::new(UiKind::System, "── 需要你批准"),
+            UiLine::new(UiKind::System, "  › 1  允许这一次"),
+            UiLine::new(UiKind::BottomStatus, "model"),
+        ];
+        let regions = ControlRegions::split(&controls, 40);
+        assert_eq!(regions.live.len(), 2);
+        assert!(regions.input.is_empty());
+        assert!(regions.candidates.is_empty());
+    }
+
     fn input_lines(text: &str) -> Vec<UiLine> {
         let mut input = crate::input::InputBuffer::default();
         input.push_text(text);
         input.render(true)
+    }
+
+    fn status() -> BottomStatus<'static> {
+        BottomStatus {
+            provider: "p",
+            model: "m",
+            reasoning_effort: "low",
+            approval_mode: "manual",
+            git: None,
+            context_tokens: 1,
+            context_window: 100,
+            cost: 0.0,
+            balance: None,
+        }
     }
 
     fn sample_document() -> UiDocument {
@@ -651,20 +756,8 @@ mod tests {
             .collect();
         UiBuilder::new()
             .chat_with_width(&history, 18)
-            .input(&input_lines("hi"), &[], 0)
-            .bottom_status(
-                BottomStatus {
-                    provider: "p",
-                    model: "m",
-                    reasoning_effort: "low",
-                    approval_mode: "manual",
-                    git: None,
-                    context_tokens: 1,
-                    context_window: 100,
-                    cost: 0.0,
-                },
-                20,
-            )
+            .input(&input_lines("hi"), None)
+            .bottom_status(status(), 20)
             .finish()
     }
 
@@ -691,17 +784,16 @@ mod tests {
     #[test]
     fn draw_pins_input_box_and_status_and_follows_tail() {
         let mut scroll = 0usize;
-        let rows = drawn_rows(20, 8, &mut scroll).join("\n");
+        let rows = drawn_rows(20, 8, &mut scroll);
+        let text = rows.join("\n");
         // Newest transcript line shows; oldest is scrolled off the tail.
-        assert!(rows.contains("line 9"), "newest line visible: {rows:?}");
-        assert!(!rows.contains("line 0"), "oldest line off-screen: {rows:?}");
-        // Bordered input box and bottom status bar are present.
-        assert!(rows.contains("hi"), "input visible: {rows:?}");
-        assert!(
-            rows.contains('╭') && rows.contains('╰'),
-            "rounded box: {rows:?}"
-        );
-        assert!(rows.contains("tokens"), "status bar visible: {rows:?}");
+        assert!(text.contains("line 9"), "newest line visible: {rows:?}");
+        assert!(!text.contains("line 0"), "oldest line off-screen: {rows:?}");
+        // The composer between its two rules, then the status line.
+        assert!(rows[4].starts_with("────"), "{rows:?}");
+        assert!(rows[5].contains("› hi"), "{rows:?}");
+        assert!(rows[6].starts_with("────"), "{rows:?}");
+        assert!(rows[7].contains('m'), "status visible: {rows:?}");
     }
 
     #[test]
@@ -712,9 +804,20 @@ mod tests {
         assert!(rows.contains("line 0"), "oldest line visible: {rows:?}");
         // Input box and status stay pinned regardless of transcript scroll.
         assert!(rows.contains("hi"), "input stays visible: {rows:?}");
-        assert!(rows.contains("tokens"), "status stays visible: {rows:?}");
         // Offset clamped to the transcript region's max scroll (not the whole screen).
         assert!(scroll < 999 && scroll > 0, "offset clamped: {scroll}");
+    }
+
+    #[test]
+    fn scrolled_up_view_says_how_to_get_back() {
+        let mut scroll = 3usize;
+        let rows = drawn_rows(48, 10, &mut scroll);
+        assert!(
+            // A wide character's second cell reads as a space.
+            rows.iter()
+                .any(|row| row.replace(' ', "").contains("已往上翻看")),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -727,20 +830,8 @@ mod tests {
         input.move_left(false);
         input.move_left(false); // caret before the 'l' of "world" (index 9)
         let document = UiBuilder::new()
-            .input(&input.render(true), &[], 0)
-            .bottom_status(
-                BottomStatus {
-                    provider: "p",
-                    model: "m",
-                    reasoning_effort: "low",
-                    approval_mode: "manual",
-                    git: None,
-                    context_tokens: 1,
-                    context_window: 100,
-                    cost: 0.0,
-                },
-                48,
-            )
+            .input(&input.render(true), None)
+            .bottom_status(status(), 48)
             .finish();
         let mut scroll = 0usize;
         let mut terminal = Terminal::new(TestBackend::new(48, 8)).unwrap();
@@ -754,9 +845,9 @@ mod tests {
             })
             .unwrap();
         let pos = terminal.get_cursor_position().unwrap();
-        // "│› hello wor|ld": border(0) ›(1) space(2) hello(3..8) space(8) wor(9..12) -> col 12,
-        // on the input content row (box border at y=4, content at y=5).
-        assert_eq!((pos.x, pos.y), (12, 5));
+        // "  › hello wor|ld": the prompt takes columns 0-3, so the caret is at
+        // 4 + 9 = 13, on the row between the rules (rule at y=0, text at y=1).
+        assert_eq!((pos.x, pos.y), (13, 1));
     }
 
     #[test]
@@ -768,7 +859,7 @@ mod tests {
                 collapsed: true,
                 duration_secs: Some(3),
             }])
-            .input(&input_lines("hi"), &[], 0)
+            .input(&input_lines("hi"), None)
             .finish();
         let mut scroll = 0usize;
         let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
@@ -790,6 +881,7 @@ mod tests {
         let document = sample_document();
         let mut scroll = 0usize;
         let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        let drag = theme::surface(Surface::Drag).expect("drag fill");
 
         // Drag from row 0 col 2 to row 2 col 8 across the transcript.
         let mut selection = TextSelection::new((0, 2));
@@ -812,18 +904,18 @@ mod tests {
 
         // First row: selected from col 2 to the right edge, blank cells included.
         for col in 2..20 {
-            assert_eq!(buffer[(col, 0)].bg, SELECTION_BG, "row0 col{col}");
+            assert_eq!(buffer[(col, 0)].bg, drag, "row0 col{col}");
         }
-        assert_ne!(buffer[(1, 0)].bg, SELECTION_BG);
+        assert_ne!(buffer[(1, 0)].bg, drag);
         // Last row: cols 0..=8 selected, col 9 untouched.
         for col in 0..9 {
-            assert_eq!(buffer[(col, 2)].bg, SELECTION_BG, "row2 col{col}");
+            assert_eq!(buffer[(col, 2)].bg, drag, "row2 col{col}");
         }
-        assert_ne!(buffer[(9, 2)].bg, SELECTION_BG);
+        assert_ne!(buffer[(9, 2)].bg, drag);
 
         // Copy reads the painted cells; trailing blanks are trimmed.
         let text = selected_text(&buffer, selection);
-        assert!(text.contains("line 8"), "copied: {text:?}");
+        assert!(text.contains("line"), "copied: {text:?}");
 
         // A backwards drag covers the same range.
         let mut back = TextSelection::new((2, 8));

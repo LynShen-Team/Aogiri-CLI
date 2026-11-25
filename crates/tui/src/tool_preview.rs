@@ -1,149 +1,262 @@
-use std::borrow::Cow;
+//! How a tool call reads in the transcript: a verb, the target, the result
+//! on one line, and the output below it (folded by the builder).
+
 use std::path::Path;
 
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
-use crate::{
-    truncate_line_spans, UiKind, UiLine, ACCENT, INPUT_SELECTION, TOOL_OUTPUT_PREVIEW_BYTES,
-    TOOL_OUTPUT_PREVIEW_LINES,
-};
+use crate::lang::t;
+use crate::theme::{self, Surface};
+use crate::ui_builder::DIFF_HEAD_LINES;
+use crate::{UiKind, UiLine};
 
-const STRONG: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
-const DIM: Style = Style::new().fg(Color::DarkGray);
-const BASH_COMMAND: Style = Style::new().fg(Color::Rgb(220, 224, 232));
-const ERROR: Style = Style::new().fg(Color::Red);
+/// Generic output lines kept when a block is collapsed.
+const GENERIC_HEAD_LINES: usize = 6;
+/// Characters kept per output line (a minified file would wrap for pages).
+const MAX_LINE_CHARS: usize = 400;
 
-pub(crate) fn tool_output_preview(name: &str, output: &str, running: bool) -> Vec<UiLine> {
-    if is_shell_tool(name) && running {
-        return limited_preview(output);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolState {
+    Running,
+    Done,
+    Failed,
+}
+
+/// Which end of the output a collapsed block keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyMode {
+    /// The last lines (command output: the result is at the end).
+    Tail,
+    /// The first `n` lines (diffs, listings).
+    Head(usize),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolView {
+    pub(crate) verb: String,
+    /// The target: the command, the path, the query.
+    pub(crate) arg: String,
+    /// The result after the target: `退出码 101`, `+2 −2`, `90 行`.
+    pub(crate) extra: Vec<Span<'static>>,
+    pub(crate) state: ToolState,
+    pub(crate) body: Vec<UiLine>,
+    pub(crate) body_mode: BodyMode,
+    /// Output lines hang off a `│` rule; diffs carry their own line numbers.
+    pub(crate) gutter: bool,
+}
+
+pub(crate) fn tool_view(name: &str, output: &str, running: bool) -> ToolView {
+    let mut view = ToolView {
+        verb: tool_verb(name),
+        arg: String::new(),
+        extra: Vec::new(),
+        state: if running {
+            ToolState::Running
+        } else {
+            ToolState::Done
+        },
+        body: Vec::new(),
+        body_mode: BodyMode::Head(GENERIC_HEAD_LINES),
+        gutter: true,
+    };
+    let value = serde_json::from_str::<serde_json::Value>(output)
+        .ok()
+        .filter(serde_json::Value::is_object);
+
+    // `!command` typed by the user: run here, not by the model.
+    let local_command = name.strip_prefix("! ");
+    if let Some(command) = local_command {
+        view.arg = first_line(command);
     }
-    // Any tool can fail with {"error": "…"}; show the message, not raw JSON.
-    if let Some(error) = json_error(output) {
-        return vec![UiLine::new(
-            UiKind::Tool,
-            Line::from(Span::styled(format!("error: {error}"), ERROR)),
+    // Any tool can fail with {"error": "…"} (a shell session too); show the
+    // message, not raw JSON.
+    if let Some(error) = value.as_ref().and_then(json_error) {
+        view.state = ToolState::Failed;
+        if let Some(command) = value
+            .as_ref()
+            .and_then(|value| value.get("command"))
+            .and_then(serde_json::Value::as_str)
+        {
+            view.arg = first_line(command);
+        }
+        let mut lines = error.lines();
+        view.extra = vec![Span::styled(
+            lines.next().unwrap_or_default().to_string(),
+            theme::err(),
         )];
+        view.body = lines.map(|line| dim_line(line.to_string())).collect();
+        return view;
     }
-    if let Some(preview) = projected_tool_output(name, output) {
-        return preview;
+    if local_command.is_some() || is_shell_tool(name) || name == "write_stdin" {
+        match &value {
+            Some(value) => shell_view(&mut view, value, running),
+            None => {
+                view.body = text_lines(output);
+                view.body_mode = BodyMode::Tail;
+            }
+        }
+        return view;
     }
-    if is_edit_tool(name) {
-        if let Some(diff) = diff_from_tool_output(output) {
-            return with_rejected_hunks_line(edit_diff_view(&diff), output);
+    if let Some(value) = &value {
+        if projected_view(&mut view, name, value) {
+            return view;
         }
     }
     if let Some(diff) = diff_from_tool_output(output) {
-        return with_rejected_hunks_line(diff_preview(&diff), output);
+        diff_view(&mut view, &diff);
+        view.body.extend(rejected_hunks_line(output));
+        return view;
     }
-    limited_preview(output)
+    // Anything else: the first line as the target, the rest below it.
+    let mut lines = text_lines(output);
+    if !lines.is_empty() {
+        view.arg = lines.remove(0).plain();
+    }
+    view.body = lines;
+    view
 }
 
-/// After a partial (hunk-subset) approval the tool's diff already contains
-/// only the applied hunks; append a count of the user-rejected ones so the
-/// preview does not read as the full requested change.
-fn with_rejected_hunks_line(mut preview: Vec<UiLine>, output: &str) -> Vec<UiLine> {
-    let rejected = serde_json::from_str::<serde_json::Value>(output)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("rejected_hunks")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len)
-        })
-        .unwrap_or(0);
-    if rejected == 0 {
-        return preview;
-    }
-    preview.push(UiLine::new(
-        UiKind::Tool,
-        Line::from(Span::styled(
-            format!("{rejected} hunk(s) rejected by user (not applied)"),
-            DIM,
-        )),
-    ));
-    preview
-}
-
-pub(crate) fn format_tool_header(
-    name: &str,
-    running: bool,
-    preview_first: Option<&Line<'static>>,
-    width: usize,
-) -> Line<'static> {
-    let action = tool_action_label(name);
-    let mut spans = vec![
-        Span::styled("●", ACCENT),
-        Span::raw(" "),
-        Span::styled(action.to_string(), STRONG),
-    ];
-    if running {
-        spans.push(Span::styled(" running", DIM));
-    }
-
-    let Some(first) = preview_first.filter(|line| line.width() > 0) else {
-        return Line::from(spans);
+/// The verb a tool call reads as.
+fn tool_verb(name: &str) -> String {
+    let verb = match name {
+        "bash" | "exec_command" | "execute" | "shell_command" => t("运行", "Ran"),
+        "edit" | "str_replace" | "hashline_edit" | "apply_patch" => t("编辑", "Edited"),
+        "write" => t("写入", "Wrote"),
+        "read" => t("读取", "Read"),
+        "ls" => t("列出", "Listed"),
+        "rg" | "ripgrep" | "search" => t("搜索", "Searched"),
+        "web_search" => t("搜索网页", "Searched the web"),
+        "write_stdin" => t("输入", "Sent"),
+        "outline" => t("大纲", "Outlined"),
+        "checkpoint" => t("存档", "Checkpointed"),
+        "web_fetch" => t("抓取网页", "Fetched"),
+        "generate_image" => t("生成图片", "Generated"),
+        other if other.starts_with("! ") => t("本地运行", "Ran locally"),
+        // Unknown tools (MCP too) keep their real name; `mcp__a__b` reads
+        // as `a/b`.
+        other => {
+            return match other.strip_prefix("mcp__") {
+                Some(rest) => rest.replacen("__", "/", 1),
+                None => other.to_string(),
+            };
+        }
     };
-    let head_width: usize = spans
-        .iter()
-        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
-        .sum();
-    let available = width.saturating_sub(head_width).saturating_sub(2);
-    if available == 0 {
-        return Line::from(spans);
-    }
-    spans.push(Span::raw("  "));
-    // The compact preview dimmer than the action; its own styled spans (e.g. the
-    // command chip) still win.
-    spans.extend(
-        truncate_line_spans(first, available)
-            .spans
-            .into_iter()
-            .map(|span| Span::styled(span.content, DIM.patch(span.style))),
-    );
-    Line::from(spans)
+    verb.to_string()
 }
 
 fn is_shell_tool(name: &str) -> bool {
     matches!(name, "bash" | "exec_command" | "execute" | "shell_command")
 }
 
-fn json_error(output: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(output)
-        .ok()?
+fn json_error(value: &serde_json::Value) -> Option<String> {
+    value
         .get("error")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
 }
 
-fn tool_action_label(name: &str) -> Cow<'_, str> {
-    match name {
-        "bash" | "exec_command" | "execute" | "shell_command" => "Ran".into(),
-        "edit" | "str_replace" | "hashline_edit" | "write" | "apply_patch" => "Edit".into(),
-        "read" => "Read".into(),
-        "ls" => "Listed".into(),
-        "rg" | "ripgrep" | "search" | "web_search" => "Searched".into(),
-        "write_stdin" => "Sent".into(),
-        "outline" => "Outlined".into(),
-        "checkpoint" => "Checkpointed".into(),
-        "web_fetch" => "Fetched".into(),
-        "generate_image" => "Generated".into(),
-        // Unknown tools (including MCP) keep their real name; `mcp__a__b` shows
-        // as `a/b` instead of a useless "Tool".
-        other => match other.strip_prefix("mcp__") {
-            Some(rest) => Cow::Owned(rest.replacen("__", "/", 1)),
-            None => Cow::Borrowed(other),
-        },
+fn first_line(text: &str) -> String {
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default().to_string();
+    if lines.next().is_some() {
+        format!("{first} …")
+    } else {
+        first
     }
 }
 
-fn projected_tool_output(name: &str, output: &str) -> Option<Vec<UiLine>> {
-    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+/// One output line as the transcript shows it: tabs as four spaces, other
+/// control characters dropped (a terminal would act on them), and long
+/// lines cut.
+fn clip(line: &str) -> String {
+    let mut clipped = String::with_capacity(line.len().min(MAX_LINE_CHARS + 4));
+    let mut count = 0usize;
+    for ch in line.chars() {
+        if count >= MAX_LINE_CHARS {
+            clipped.push('…');
+            break;
+        }
+        match ch {
+            '\t' => {
+                clipped.push_str("    ");
+                count += 4;
+            }
+            ch if ch.is_control() => {}
+            ch => {
+                clipped.push(ch);
+                count += 1;
+            }
+        }
+    }
+    clipped
+}
+
+fn dim_line(text: String) -> UiLine {
+    UiLine::new(
+        UiKind::Tool,
+        Line::from(Span::styled(clip(&text), theme::dim())),
+    )
+}
+
+fn text_lines(output: &str) -> Vec<UiLine> {
+    output
+        .trim_end_matches('\n')
+        .lines()
+        .map(|line| dim_line(line.to_string()))
+        .collect()
+}
+
+/// A shell result: the command as the target, the exit status as the
+/// result, stdout then stderr below.
+fn shell_view(view: &mut ToolView, value: &serde_json::Value, running: bool) {
+    if let Some(command) = value.get("command").and_then(serde_json::Value::as_str) {
+        view.arg = first_line(command);
+    }
+    view.body_mode = BodyMode::Tail;
+    let background = value
+        .get("running")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if background {
+        // A long-running command reported mid-flight carries a session.
+        view.extra = vec![Span::styled(t("后台运行中", "still running"), theme::dim())];
+    } else if !running {
+        let exit_code = value.get("exit_code").and_then(serde_json::Value::as_i64);
+        let timed_out = value
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if timed_out {
+            view.state = ToolState::Failed;
+            view.extra = vec![Span::styled(t("超时", "timed out"), theme::err())];
+        } else if let Some(code) = exit_code.filter(|code| *code != 0) {
+            view.state = ToolState::Failed;
+            let label = match crate::lang::lang() {
+                crate::lang::Lang::Zh => format!("退出码 {code}"),
+                crate::lang::Lang::En => format!("exit {code}"),
+            };
+            view.extra = vec![Span::styled(label, theme::err())];
+        }
+    }
+    for key in ["stdout", "stderr"] {
+        if let Some(body) = value.get(key).and_then(serde_json::Value::as_str) {
+            view.body.extend(text_lines(body));
+        }
+    }
+}
+
+/// Tools whose JSON result reads better as one line: `read`, `ls`,
+/// `generate_image`. Returns false for the rest.
+fn projected_view(view: &mut ToolView, name: &str, value: &serde_json::Value) -> bool {
     match name {
         "read" => {
-            let path = value.get("path").and_then(serde_json::Value::as_str)?;
+            let Some(path) = value.get("path").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            view.arg = display_path(path);
             let lines = value
                 .get("lines_read")
                 .and_then(serde_json::Value::as_u64)
@@ -151,120 +264,79 @@ fn projected_tool_output(name: &str, output: &str) -> Option<Vec<UiLine>> {
             let offset = value
                 .get("offset")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(1);
+                .unwrap_or(1)
+                .max(1);
             let truncated = value
                 .get("truncated")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let suffix = if truncated { " …" } else { "" };
-            Some(vec![plain_preview_line(format!(
-                "read {}: {lines} lines from line {offset}{suffix}",
-                display_path_name(path)
-            ))])
+            let range = if lines == 0 {
+                String::new()
+            } else if offset > 1 || truncated {
+                let end = offset + lines - 1;
+                match crate::lang::lang() {
+                    crate::lang::Lang::Zh => format!("{offset}–{end} 行"),
+                    crate::lang::Lang::En => format!("lines {offset}–{end}"),
+                }
+            } else {
+                match crate::lang::lang() {
+                    crate::lang::Lang::Zh => format!("{lines} 行"),
+                    crate::lang::Lang::En => format!("{lines} lines"),
+                }
+            };
+            if !range.is_empty() {
+                view.extra = vec![Span::styled(range, theme::dim())];
+            }
+            true
         }
         "ls" => {
-            let path = value.get("path").and_then(serde_json::Value::as_str)?;
-            Some(vec![plain_preview_line(format!("ls {}", path))])
+            let Some(path) = value.get("path").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            view.arg = display_path(path);
+            true
         }
-        "generate_image" => Some(
-            value
-                .get("paths")?
-                .as_array()?
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(|path| plain_preview_line(format!("saved {path}")))
-                .collect(),
-        ),
-        _ if is_shell_tool(name) || name == "write_stdin" => Some(project_bash_output(&value)),
-        _ => None,
+        "generate_image" => {
+            let Some(paths) = value.get("paths").and_then(serde_json::Value::as_array) else {
+                return false;
+            };
+            let mut paths = paths.iter().filter_map(serde_json::Value::as_str);
+            view.arg = paths.next().map(display_path).unwrap_or_default();
+            view.body = paths.map(|path| dim_line(display_path(path))).collect();
+            true
+        }
+        _ => false,
     }
 }
 
-fn plain_preview_line(text: String) -> UiLine {
-    UiLine::new(UiKind::Tool, Line::from(text))
+/// A path relative to the working folder when inside it, else with `~`.
+fn display_path(path: &str) -> String {
+    let cwd = std::env::current_dir().ok();
+    if let Some(cwd) = cwd {
+        if let Ok(rest) = Path::new(path).strip_prefix(&cwd) {
+            let rest = rest.to_string_lossy().replace('\\', "/");
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    crate::compact_home_path(path)
 }
 
-fn project_bash_output(value: &serde_json::Value) -> Vec<UiLine> {
-    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-        return vec![UiLine::new(
-            UiKind::Tool,
-            Line::from(Span::styled(format!("error: {error}"), ERROR)),
-        )];
+fn rejected_hunks_line(output: &str) -> Option<UiLine> {
+    let rejected = serde_json::from_str::<serde_json::Value>(output)
+        .ok()?
+        .get("rejected_hunks")?
+        .as_array()?
+        .len();
+    if rejected == 0 {
+        return None;
     }
-    let command = value
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("bash");
-    // A long-running command reported mid-flight carries a session instead of
-    // an exit code (write_stdin polls share this shape).
-    let status = if value
-        .get("running")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        let session = value
-            .get("session_id")
-            .and_then(serde_json::Value::as_u64)
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        format!("session {session} running")
-    } else {
-        let exit_code = value
-            .get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let timed_out = value
-            .get("timed_out")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        format!(
-            "exit {exit_code}{}",
-            if timed_out { ", timed out" } else { "" }
-        )
+    let text = match crate::lang::lang() {
+        crate::lang::Lang::Zh => format!("你拒绝了 {rejected} 处改动（没有应用）"),
+        crate::lang::Lang::En => format!("{rejected} hunk(s) rejected by user (not applied)"),
     };
-    let stdout = value
-        .get("stdout")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let stderr = value
-        .get("stderr")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let mut lines = vec![UiLine::new(
-        UiKind::Tool,
-        Line::from(vec![
-            Span::styled(command.to_string(), BASH_COMMAND),
-            Span::styled(format!("  {status}"), DIM),
-        ]),
-    )];
-    for (label, body) in [("stdout:", stdout), ("stderr:", stderr)] {
-        if !body.trim().is_empty() {
-            lines.push(plain_preview_line(label.to_string()));
-            lines.extend(
-                tail_lines(body, 8)
-                    .lines()
-                    .map(|line| plain_preview_line(line.to_string())),
-            );
-        }
-    }
-    lines
-}
-
-fn display_path_name(path: &str) -> String {
-    let path = path.trim_end_matches(['/', '\\']);
-    path.rsplit(['/', '\\'])
-        .find(|name| !name.is_empty())
-        .or_else(|| Path::new(path).file_name().and_then(|name| name.to_str()))
-        .filter(|name| !name.is_empty())
-        .unwrap_or(path)
-        .to_string()
-}
-
-fn tail_lines(text: &str, limit: usize) -> String {
-    let lines = text.lines().collect::<Vec<_>>();
-    let start = lines.len().saturating_sub(limit);
-    lines[start..].join("\n")
+    Some(dim_line(text))
 }
 
 fn diff_from_tool_output(output: &str) -> Option<String> {
@@ -276,24 +348,24 @@ fn diff_from_tool_output(output: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn is_edit_tool(name: &str) -> bool {
-    matches!(name, "edit" | "str_replace" | "hashline_edit" | "write")
-}
-
-fn render_full_diff(diff: &str) -> Vec<UiLine> {
-    render_intra_line_diff(&diff.lines().collect::<Vec<_>>())
-}
-
-fn edit_diff_view(diff: &str) -> Vec<UiLine> {
-    let Some(parsed) = parse_unified_diff(diff) else {
-        return render_full_diff(diff);
-    };
-    let mut lines = vec![plain_preview_line(format!(
-        "{} (+{} -{})",
-        parsed.path, parsed.additions, parsed.removals
-    ))];
-    lines.extend(parsed.lines.iter().map(EditDiffLine::render));
-    lines
+/// An edit: the path and `+a −r` on the header, numbered diff lines below.
+fn diff_view(view: &mut ToolView, diff: &str) {
+    view.gutter = false;
+    view.body_mode = BodyMode::Head(DIFF_HEAD_LINES);
+    match parse_unified_diff(diff) {
+        Some(parsed) => {
+            view.arg = parsed.path.clone();
+            view.extra = vec![
+                Span::styled(format!("+{}", parsed.additions), theme::add()),
+                Span::raw(" "),
+                Span::styled(format!("−{}", parsed.removals), theme::del()),
+            ];
+            view.body = render_edit_lines(&parsed.lines);
+        }
+        None => {
+            view.body = render_intra_line_diff(&diff.lines().collect::<Vec<_>>());
+        }
+    }
 }
 
 struct ParsedEditDiff {
@@ -310,21 +382,152 @@ enum EditDiffLine {
     Gap,
 }
 
-impl EditDiffLine {
-    fn render(&self) -> UiLine {
-        let (kind, text) = match self {
-            EditDiffLine::Context { line, text } => match line {
-                Some(line) => (UiKind::Tool, format!("{line:>6}    {text}")),
-                None => (UiKind::Tool, format!("{:>6}    {text}", "")),
-            },
-            EditDiffLine::Add { line, text } => (UiKind::DiffAdd, format!("{line:>6} +  {text}")),
-            EditDiffLine::Remove { line, text } => {
-                (UiKind::DiffRemove, format!("{line:>6} -  {text}"))
-            }
-            EditDiffLine::Gap => (UiKind::Tool, format!("{:>6}    …", "")),
-        };
-        UiLine::new(kind, Line::from(text))
+/// The highlight for the changed part of a line: a deeper fill where fills
+/// are drawn, reverse video where they are not.
+fn word_style(surface: Surface) -> Style {
+    match theme::surface(surface) {
+        Some(color) => Style::new().bg(color),
+        None => Style::new().add_modifier(Modifier::REVERSED),
     }
+}
+
+fn line_fill(surface: Surface) -> Style {
+    match theme::surface(surface) {
+        Some(color) => Style::new().bg(color),
+        None => Style::new(),
+    }
+}
+
+/// `  1469 - text`: the number untinted, the sign and the text on the
+/// line's fill (the painter extends the last span's fill to the edge).
+fn numbered_line(
+    kind: UiKind,
+    number: Option<usize>,
+    sign: char,
+    text: &str,
+    changed: Option<(usize, usize)>,
+) -> UiLine {
+    let (fg, fill, word) = match kind {
+        UiKind::DiffAdd => (
+            theme::add(),
+            line_fill(Surface::AddLine),
+            word_style(Surface::AddWord),
+        ),
+        UiKind::DiffRemove => (
+            theme::del(),
+            line_fill(Surface::DelLine),
+            word_style(Surface::DelWord),
+        ),
+        _ => (Style::new(), Style::new(), Style::new()),
+    };
+    let number = number.map(|n| n.to_string()).unwrap_or_default();
+    let mut spans = vec![
+        Span::styled(format!("{number:>5} "), theme::dim()),
+        Span::styled(format!("{sign} "), fg.patch(fill)),
+    ];
+    let text = clip(text);
+    match changed {
+        Some((start, end)) if start < end => {
+            let before: String = text.chars().take(start).collect();
+            let middle: String = text.chars().skip(start).take(end - start).collect();
+            let after: String = text.chars().skip(end).collect();
+            spans.push(Span::styled(before, fg.patch(fill)));
+            spans.push(Span::styled(middle, fg.patch(fill).patch(word)));
+            spans.push(Span::styled(after, fg.patch(fill)));
+        }
+        _ => spans.push(Span::styled(text, fg.patch(fill))),
+    }
+    UiLine::new(kind, Line::from(spans))
+}
+
+fn render_edit_lines(lines: &[EditDiffLine]) -> Vec<UiLine> {
+    let mut rendered = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        // A single removed line followed by a single added one: highlight
+        // the part that changed.
+        if let (
+            EditDiffLine::Remove {
+                line: old_line,
+                text: old,
+            },
+            Some(EditDiffLine::Add {
+                line: new_line,
+                text: new,
+            }),
+        ) = (&lines[index], lines.get(index + 1))
+        {
+            let single = !matches!(lines.get(index + 2), Some(EditDiffLine::Add { .. }))
+                && !matches!(
+                    index.checked_sub(1).and_then(|i| lines.get(i)),
+                    Some(EditDiffLine::Remove { .. })
+                );
+            if single {
+                let (prefix, old_end, new_end) = changed_span(old, new);
+                rendered.push(numbered_line(
+                    UiKind::DiffRemove,
+                    Some(*old_line),
+                    '-',
+                    old,
+                    Some((prefix, old_end)),
+                ));
+                rendered.push(numbered_line(
+                    UiKind::DiffAdd,
+                    Some(*new_line),
+                    '+',
+                    new,
+                    Some((prefix, new_end)),
+                ));
+                index += 2;
+                continue;
+            }
+        }
+        rendered.push(match &lines[index] {
+            EditDiffLine::Context { line, text } => {
+                let number = line.map(|n| n.to_string()).unwrap_or_default();
+                UiLine::new(
+                    UiKind::Tool,
+                    Line::from(vec![
+                        Span::styled(format!("{number:>5} "), theme::dim()),
+                        Span::raw(format!("  {}", clip(text))),
+                    ]),
+                )
+            }
+            EditDiffLine::Add { line, text } => {
+                numbered_line(UiKind::DiffAdd, Some(*line), '+', text, None)
+            }
+            EditDiffLine::Remove { line, text } => {
+                numbered_line(UiKind::DiffRemove, Some(*line), '-', text, None)
+            }
+            EditDiffLine::Gap => UiLine::new(
+                UiKind::Tool,
+                Line::from(Span::styled(format!("{:>5} ", "⋮"), theme::faint())),
+            ),
+        });
+        index += 1;
+    }
+    rendered
+}
+
+/// Common prefix length and the end of the changed part in each line (in
+/// chars).
+fn changed_span(old: &str, new: &str) -> (usize, usize, usize) {
+    let old_chars = old.chars().collect::<Vec<_>>();
+    let new_chars = new.chars().collect::<Vec<_>>();
+    let mut prefix = 0usize;
+    while prefix < old_chars.len()
+        && prefix < new_chars.len()
+        && old_chars[prefix] == new_chars[prefix]
+    {
+        prefix += 1;
+    }
+    let mut old_end = old_chars.len();
+    let mut new_end = new_chars.len();
+    while old_end > prefix && new_end > prefix && old_chars[old_end - 1] == new_chars[new_end - 1] {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    (prefix, old_end, new_end)
 }
 
 fn parse_unified_diff(diff: &str) -> Option<ParsedEditDiff> {
@@ -399,11 +602,17 @@ fn parse_unified_diff(diff: &str) -> Option<ParsedEditDiff> {
 }
 
 fn diff_file_path(line: &str) -> String {
-    let label = diff_file_label(line);
-    label
-        .strip_prefix("diff ")
-        .unwrap_or(label.as_str())
-        .to_string()
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 4 {
+        return line.to_string();
+    }
+    let old_path = parts[2].strip_prefix("a/").unwrap_or(parts[2]);
+    let new_path = parts[3].strip_prefix("b/").unwrap_or(parts[3]);
+    if old_path == new_path {
+        new_path.to_string()
+    } else {
+        format!("{old_path} → {new_path}")
+    }
 }
 
 fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
@@ -428,146 +637,30 @@ fn parse_hunk_start(value: &str) -> Option<usize> {
         .ok()
 }
 
-fn diff_preview(diff: &str) -> Vec<UiLine> {
-    let mut preview: Vec<UiLine> = Vec::new();
-    let mut preview_bytes = 0usize;
-    let mut file_label = None;
-    let mut hunk_header = None;
-    let mut change_lines = Vec::new();
-    let mut in_first_hunk = false;
-    let mut saw_next_hunk = false;
-
-    for line in diff.lines() {
-        if file_label.is_none() && line.starts_with("diff --git ") {
-            file_label = Some(diff_file_label(line));
-            continue;
-        }
-        if line.starts_with("@@") {
-            if in_first_hunk {
-                saw_next_hunk = true;
-                break;
-            }
-            hunk_header = Some(line);
-            in_first_hunk = true;
-            continue;
-        }
-        if in_first_hunk && is_diff_change_line(line) {
-            change_lines.push(line);
-        }
-    }
-
-    let Some(header) = hunk_header else {
-        return limited_preview(diff);
-    };
-    if change_lines.is_empty() {
-        return limited_preview(diff);
-    }
-
-    let mut truncated = saw_next_hunk;
-    if let Some(label) = file_label.as_deref() {
-        truncated |= !push_preview_text(&mut preview, &mut preview_bytes, label);
-    }
-    truncated |= !push_preview_text(&mut preview, &mut preview_bytes, header);
-
-    let line_budget = TOOL_OUTPUT_PREVIEW_LINES.saturating_sub(preview.len());
-    let selected = balanced_diff_lines(&change_lines, line_budget);
-    truncated |= selected.len() < change_lines.len();
-    for line in render_intra_line_diff(&selected) {
-        truncated |= !push_preview_line(&mut preview, &mut preview_bytes, line);
-    }
-
-    if truncated {
-        preview.push(plain_preview_line("…".to_string()));
-    }
-
-    preview
-}
-
-fn diff_file_label(line: &str) -> String {
-    let parts = line.split_whitespace().collect::<Vec<_>>();
-    if parts.len() < 4 {
-        return line.to_string();
-    }
-    let old_path = parts[2].strip_prefix("a/").unwrap_or(parts[2]);
-    let new_path = parts[3].strip_prefix("b/").unwrap_or(parts[3]);
-    if old_path == new_path {
-        format!("diff {new_path}")
-    } else {
-        format!("diff {old_path} -> {new_path}")
-    }
-}
-
 fn is_diff_change_line(line: &str) -> bool {
     (line.starts_with('+') && !line.starts_with("+++"))
         || (line.starts_with('-') && !line.starts_with("---"))
 }
 
-fn balanced_diff_lines<'a>(lines: &[&'a str], limit: usize) -> Vec<&'a str> {
-    if lines.len() <= limit {
-        return lines.to_vec();
-    }
-    if limit == 0 {
-        return Vec::new();
-    }
-
-    let added = lines.iter().filter(|line| line.starts_with('+')).count();
-    let removed = lines.iter().filter(|line| line.starts_with('-')).count();
-    if added == 0 || removed == 0 || limit == 1 {
-        return lines.iter().copied().take(limit).collect();
-    }
-
-    let mut added_limit = added.min((limit / 2).max(1));
-    let mut removed_limit = removed.min(limit.saturating_sub(added_limit));
-    let unused = limit.saturating_sub(added_limit + removed_limit);
-    if unused > 0 {
-        let added_left = added.saturating_sub(added_limit);
-        let removed_left = removed.saturating_sub(removed_limit);
-        if added_left >= removed_left {
-            let extra = unused.min(added_left);
-            added_limit += extra;
-            removed_limit += unused.saturating_sub(extra).min(removed_left);
-        } else {
-            let extra = unused.min(removed_left);
-            removed_limit += extra;
-            added_limit += unused.saturating_sub(extra).min(added_left);
-        }
-    }
-    let mut added_used = 0usize;
-    let mut removed_used = 0usize;
-    let mut selected = Vec::new();
-
-    for line in lines {
-        if line.starts_with('+') {
-            if added_used >= added_limit {
-                continue;
-            }
-            added_used += 1;
-        } else if line.starts_with('-') {
-            if removed_used >= removed_limit {
-                continue;
-            }
-            removed_used += 1;
-        }
-        selected.push(*line);
-    }
-
-    selected
-}
-
+/// A diff without a parseable header: `+`/`-` lines coloured, a lone
+/// removed/added pair highlighted where it changed.
 fn render_intra_line_diff(lines: &[&str]) -> Vec<UiLine> {
     let mut rendered = Vec::new();
     let mut index = 0usize;
-
     while index < lines.len() {
         if !is_diff_change_line(lines[index]) {
+            let style = if lines[index].starts_with("@@") || lines[index].starts_with("diff ") {
+                theme::dim()
+            } else {
+                Style::new()
+            };
             rendered.push(UiLine::new(
-                diff_line_kind(lines[index]),
-                Line::from(lines[index].to_string()),
+                UiKind::Tool,
+                Line::from(Span::styled(clip(lines[index]), style)),
             ));
             index += 1;
             continue;
         }
-
         let removed_start = index;
         while index < lines.len()
             && is_diff_change_line(lines[index])
@@ -582,166 +675,169 @@ fn render_intra_line_diff(lines: &[&str]) -> Vec<UiLine> {
         {
             index += 1;
         }
-
         let removed = &lines[removed_start..added_start];
         let added = &lines[added_start..index];
         if removed.len() == 1 && added.len() == 1 {
-            let (old_line, new_line) = render_intra_line_pair(removed[0], added[0]);
-            rendered.push(old_line);
-            rendered.push(new_line);
+            let old = &removed[0][1..];
+            let new = &added[0][1..];
+            let (prefix, old_end, new_end) = changed_span(old, new);
+            rendered.push(numbered_line(
+                UiKind::DiffRemove,
+                None,
+                '-',
+                old,
+                Some((prefix, old_end)),
+            ));
+            rendered.push(numbered_line(
+                UiKind::DiffAdd,
+                None,
+                '+',
+                new,
+                Some((prefix, new_end)),
+            ));
         } else {
-            rendered.extend(
-                removed
-                    .iter()
-                    .map(|line| UiLine::new(UiKind::DiffRemove, Line::from((*line).to_string()))),
-            );
-            rendered.extend(
-                added
-                    .iter()
-                    .map(|line| UiLine::new(UiKind::DiffAdd, Line::from((*line).to_string()))),
-            );
+            for line in removed {
+                rendered.push(numbered_line(
+                    UiKind::DiffRemove,
+                    None,
+                    '-',
+                    &line[1..],
+                    None,
+                ));
+            }
+            for line in added {
+                rendered.push(numbered_line(UiKind::DiffAdd, None, '+', &line[1..], None));
+            }
         }
     }
-
     rendered
 }
 
-fn render_intra_line_pair(old_line: &str, new_line: &str) -> (UiLine, UiLine) {
-    let old_content = old_line.strip_prefix('-').unwrap_or(old_line);
-    let new_content = new_line.strip_prefix('+').unwrap_or(new_line);
-    let old_chars = old_content.chars().collect::<Vec<_>>();
-    let new_chars = new_content.chars().collect::<Vec<_>>();
-    let mut prefix = 0usize;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    while prefix < old_chars.len()
-        && prefix < new_chars.len()
-        && old_chars[prefix] == new_chars[prefix]
-    {
-        prefix += 1;
+    fn body_text(view: &ToolView) -> String {
+        view.body
+            .iter()
+            .map(UiLine::plain)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    let mut old_suffix = old_chars.len();
-    let mut new_suffix = new_chars.len();
-    while old_suffix > prefix
-        && new_suffix > prefix
-        && old_chars[old_suffix - 1] == new_chars[new_suffix - 1]
-    {
-        old_suffix -= 1;
-        new_suffix -= 1;
+    fn extra_text(view: &ToolView) -> String {
+        view.extra
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
-    (
-        UiLine::new(
-            UiKind::DiffRemove,
-            diff_change_line('-', old_content, prefix, old_suffix),
-        ),
-        UiLine::new(
-            UiKind::DiffAdd,
-            diff_change_line('+', new_content, prefix, new_suffix),
-        ),
-    )
-}
-
-fn diff_change_line(prefix: char, text: &str, start: usize, end: usize) -> Line<'static> {
-    let mut spans = vec![Span::raw(prefix.to_string())];
-    if start >= end {
-        spans.push(Span::raw(text.to_string()));
-        return Line::from(spans);
-    }
-    let before: String = text.chars().take(start).collect();
-    let changed: String = text.chars().skip(start).take(end - start).collect();
-    let after: String = text.chars().skip(end).collect();
-    if !before.is_empty() {
-        spans.push(Span::raw(before));
-    }
-    spans.push(Span::styled(changed, INPUT_SELECTION));
-    if !after.is_empty() {
-        spans.push(Span::raw(after));
-    }
-    Line::from(spans)
-}
-
-fn push_preview_line(preview: &mut Vec<UiLine>, preview_bytes: &mut usize, line: UiLine) -> bool {
-    if preview.len() >= TOOL_OUTPUT_PREVIEW_LINES {
-        return false;
+    #[test]
+    fn failed_command_shows_exit_code_and_tail_mode() {
+        let output = serde_json::json!({
+            "command": "cargo test",
+            "exit_code": 101,
+            "stdout": "running 4 tests\ntest a ... FAILED",
+            "stderr": "",
+        })
+        .to_string();
+        let view = tool_view("bash", &output, false);
+        assert_eq!(view.verb, "运行");
+        assert_eq!(view.arg, "cargo test");
+        assert_eq!(view.state, ToolState::Failed);
+        assert_eq!(extra_text(&view), "退出码 101");
+        assert_eq!(view.body_mode, BodyMode::Tail);
+        assert!(body_text(&view).contains("FAILED"));
     }
 
-    let line_len: usize = line.line.spans.iter().map(|span| span.content.len()).sum();
-    let next_bytes = preview_bytes
-        .saturating_add(line_len)
-        .saturating_add(usize::from(!preview.is_empty()));
-    if next_bytes > TOOL_OUTPUT_PREVIEW_BYTES {
-        return false;
+    #[test]
+    fn successful_command_has_no_result_label() {
+        let output =
+            serde_json::json!({"command": "ls", "exit_code": 0, "stdout": "a\nb"}).to_string();
+        let view = tool_view("bash", &output, false);
+        assert_eq!(view.state, ToolState::Done);
+        assert!(view.extra.is_empty());
+        assert_eq!(view.body.len(), 2);
     }
 
-    preview.push(line);
-    *preview_bytes = next_bytes;
-    true
-}
-
-fn push_preview_text(preview: &mut Vec<UiLine>, preview_bytes: &mut usize, line: &str) -> bool {
-    push_preview_line(
-        preview,
-        preview_bytes,
-        UiLine::new(diff_line_kind(line), Line::from(line.to_string())),
-    )
-}
-
-fn limited_preview(output: &str) -> Vec<UiLine> {
-    let mut preview = Vec::new();
-    let mut preview_bytes = 0usize;
-    let mut truncated = false;
-
-    for line in output.lines() {
-        if !push_preview_text(&mut preview, &mut preview_bytes, line) {
-            truncated = true;
-            break;
-        }
+    #[test]
+    fn edit_diff_has_counts_numbers_and_word_highlight() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n@@ -10,3 +10,3 @@\n fn a() {\n-    let w = 1;\n+    let w = ch.width();\n }\n";
+        let output = serde_json::json!({ "diff": diff }).to_string();
+        let view = tool_view("edit", &output, false);
+        assert_eq!(view.verb, "编辑");
+        assert_eq!(view.arg, "src/lib.rs");
+        assert_eq!(extra_text(&view), "+1 −1");
+        assert!(!view.gutter);
+        let text = body_text(&view);
+        assert!(text.contains("   11 -     let w = 1;"), "{text}");
+        assert!(text.contains("   11 +     let w = ch.width();"), "{text}");
+        // The changed part sits on its own span.
+        let added = view
+            .body
+            .iter()
+            .find(|line| line.kind == UiKind::DiffAdd)
+            .unwrap();
+        assert!(added
+            .line
+            .spans
+            .iter()
+            .any(|span| span.content == "ch.width()"));
     }
 
-    if output.is_empty() {
-        preview.push(plain_preview_line("(empty output)".to_string()));
-    } else if output.lines().count() > preview.len() {
-        truncated = true;
+    #[test]
+    fn error_result_shows_the_message_in_the_error_colour() {
+        let view = tool_view("read", r#"{"error":"no such file"}"#, false);
+        assert_eq!(view.state, ToolState::Failed);
+        assert_eq!(extra_text(&view), "no such file");
+        assert_eq!(view.extra[0].style, theme::err());
     }
 
-    if truncated {
-        preview.push(plain_preview_line("…".to_string()));
+    #[test]
+    fn read_shows_path_and_line_range() {
+        let output = r#"{"path":"notes.md","lines_read":91,"offset":1440,"truncated":false}"#;
+        let view = tool_view("read", output, false);
+        assert_eq!(view.verb, "读取");
+        assert_eq!(view.arg, "notes.md");
+        assert_eq!(extra_text(&view), "1440–1530 行");
+        assert!(view.body.is_empty());
     }
 
-    preview
-}
+    #[test]
+    fn rejected_hunks_are_counted_after_the_diff() {
+        let diff = "diff --git a/a b/a\n@@ -1 +1 @@\n-x\n+y\n";
+        let output = serde_json::json!({ "diff": diff, "rejected_hunks": ["h2"] }).to_string();
+        let view = tool_view("str_replace", &output, false);
+        assert!(body_text(&view).contains("你拒绝了 1 处改动"));
+    }
 
-pub(crate) fn diff_line_kind(line: &str) -> UiKind {
-    if let Some(kind) = edit_view_line_kind(line) {
-        return kind;
+    #[test]
+    fn output_tabs_become_spaces_and_control_characters_go() {
+        let output = serde_json::json!({
+            "command": "du -sh target",
+            "exit_code": 0,
+            "stdout": "4.1G\ttarget\r\n\u{1b}[0mdone",
+        })
+        .to_string();
+        let view = tool_view("bash", &output, false);
+        assert_eq!(body_text(&view), "4.1G    target\n[0mdone");
     }
-    if line.starts_with("+++") || line.starts_with("---") {
-        UiKind::DiffHeader
-    } else if line.starts_with('+') {
-        UiKind::DiffAdd
-    } else if line.starts_with('-') {
-        UiKind::DiffRemove
-    } else if line.starts_with("@@") || line.starts_with("diff --git") || line.starts_with("index ")
-    {
-        UiKind::DiffHeader
-    } else {
-        UiKind::Tool
-    }
-}
 
-fn edit_view_line_kind(line: &str) -> Option<UiKind> {
-    let trimmed = line.trim_start();
-    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
-    if digits == 0 {
-        return None;
+    #[test]
+    fn mcp_tools_read_as_server_and_tool() {
+        assert_eq!(
+            tool_view("mcp__github__list_issues", "", false).verb,
+            "github/list_issues"
+        );
     }
-    let rest = &trimmed[digits..];
-    if rest.starts_with(" +") {
-        Some(UiKind::DiffAdd)
-    } else if rest.starts_with(" -") {
-        Some(UiKind::DiffRemove)
-    } else {
-        None
+
+    #[test]
+    fn english_wording_when_the_locale_is_english() {
+        crate::lang::with_lang(crate::lang::Lang::En, || {
+            let output = serde_json::json!({"command": "false", "exit_code": 1}).to_string();
+            let view = tool_view("bash", &output, false);
+            assert_eq!(view.verb, "Ran");
+            assert_eq!(extra_text(&view), "exit 1");
+        });
     }
 }

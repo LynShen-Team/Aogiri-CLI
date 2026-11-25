@@ -1,22 +1,27 @@
 #[cfg(feature = "bench")]
 pub mod bench_support;
+mod fuzzy;
 mod git_bar;
 mod input;
+mod lang;
 mod local_shell;
 mod markdown;
 mod mention;
 mod picker;
+#[cfg(feature = "preview")]
+pub mod preview_support;
 mod state;
 mod terminal_renderer;
 #[cfg(test)]
 mod tests;
+mod theme;
 mod tool_preview;
 mod ui_builder;
 
 use git_bar::GitStatusTracker;
 use input::{paste_burst_render_delay, InputBuffer, PasteBurst, PasteCharDecision, PasteFlush};
 use local_shell::{local_shell_command, LocalShellRunner};
-use lynshen_agent_core::{AgentEvent, CommandView, TranscriptItem};
+use lynshen_agent_core::{AccountLookup, AccountSummary, AgentEvent, CommandView, TranscriptItem};
 use picker::{PickerMode, PickerState, TreePromptAction};
 use ratatui::crossterm::{
     cursor::{Hide, Show},
@@ -28,7 +33,7 @@ use ratatui::crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 use state::TuiState;
@@ -42,9 +47,9 @@ use ui_builder::UiBuilder;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
-const TOOL_OUTPUT_PREVIEW_LINES: usize = 12;
-const TOOL_OUTPUT_PREVIEW_BYTES: usize = 2_000;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// Output that brings nothing new for this long reads as stalled.
+const STALL_AFTER: Duration = Duration::from_secs(8);
 const PASTE_PLACEHOLDER_CHARS: usize = 200;
 const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(8);
 const PASTE_ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
@@ -52,28 +57,20 @@ const PASTE_ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
 const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(8);
 #[cfg(windows)]
 const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(60);
-const VISIBLE_CURSOR: &str = "|";
 const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
 const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
 pub(crate) const CONTENT_LEFT_PADDING: usize = 2;
-const STARTUP_TEXT: Style = Style::new().fg(Color::Rgb(180, 176, 187));
-const STARTUP_DIM: Style = Style::new().fg(Color::Rgb(125, 121, 134));
-const STARTUP_ACCENT: Style = Style::new().fg(Color::Rgb(190, 160, 255));
-/// Brand accent for turn markers (tool bullets); same hue as the startup card.
-pub(crate) const ACCENT: Style = STARTUP_ACCENT;
-const STARTUP_STRONG: Style = Style::new()
-    .fg(Color::Rgb(232, 228, 238))
-    .add_modifier(Modifier::BOLD);
 /// The composer's own text selection (not the mouse drag overlay).
 pub(crate) const INPUT_SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
-const BOX_BORDER: Style = Style::new().fg(Color::Rgb(108, 96, 140));
+/// A second ctrl+c within this window quits.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+/// The account (balance, plan) is looked up again at most this often.
+const ACCOUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub(crate) enum ChatLine {
     Startup {
         version: String,
-        profile_dir: String,
-        config_path: String,
         cwd: String,
         model: String,
         context_window: u64,
@@ -94,6 +91,8 @@ pub(crate) enum ChatLine {
         name: String,
         output: String,
         running: bool,
+        /// Clicked open: shows its full output.
+        expanded: bool,
     },
     System(String),
     Error(String),
@@ -101,7 +100,6 @@ pub(crate) enum ChatLine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiKind {
-    Brand,
     User,
     Assistant,
     ToolHeader,
@@ -112,10 +110,12 @@ pub(crate) enum UiKind {
     BottomStatus,
     Selected,
     Input,
-    TreeDirectory,
     DiffAdd,
     DiffRemove,
-    DiffHeader,
+    /// A row of the command palette, file matches or the shortcut sheet
+    /// under the composer.
+    Candidate,
+    CandidateSelected,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,7 +199,43 @@ pub(crate) struct ProjectedDocument {
     cursor: Option<CursorTarget>,
 }
 
+/// The LynShen account behind the provider, as far as it is known.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum AccountState {
+    #[default]
+    Unknown,
+    NotLynShen,
+    SignedOut,
+    Ready(AccountSummary),
+    Failed,
+}
+
+impl From<AccountLookup> for AccountState {
+    fn from(lookup: AccountLookup) -> Self {
+        match lookup {
+            AccountLookup::NotLynShen => Self::NotLynShen,
+            AccountLookup::SignedOut => Self::SignedOut,
+            AccountLookup::Summary(summary) => Self::Ready(summary),
+            AccountLookup::Failed(_) => Self::Failed,
+        }
+    }
+}
+
+impl AccountState {
+    /// The balance for the status bar, e.g. `¥128.40`.
+    pub(crate) fn balance(&self) -> Option<String> {
+        match self {
+            Self::Ready(summary) => summary
+                .balance
+                .as_deref()
+                .map(|balance| ui_builder::format_balance(balance, summary.currency.as_deref())),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct BottomStatus<'a> {
+    #[allow(dead_code)]
     pub(crate) provider: &'a str,
     pub(crate) model: &'a str,
     pub(crate) reasoning_effort: &'a str,
@@ -208,12 +244,18 @@ pub(crate) struct BottomStatus<'a> {
     pub(crate) context_tokens: u64,
     pub(crate) context_window: u64,
     pub(crate) cost: f64,
+    /// The account balance, already formatted.
+    pub(crate) balance: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CommandCandidate {
     pub(crate) command: String,
     pub(crate) marker: Option<String>,
+    /// The engine's description (English); built-ins show a Chinese one.
+    pub(crate) description: String,
+    /// Characters of `command` the typed query matched.
+    pub(crate) highlight: Vec<usize>,
 }
 
 impl From<CommandView> for CommandCandidate {
@@ -221,6 +263,8 @@ impl From<CommandView> for CommandCandidate {
         Self {
             command: value.command,
             marker: value.marker,
+            description: value.description,
+            highlight: Vec::new(),
         }
     }
 }
@@ -233,9 +277,69 @@ fn default_commands() -> Vec<CommandCandidate> {
     .iter()
     .map(|command| CommandCandidate {
         command: (*command).to_string(),
-        marker: None,
+        ..CommandCandidate::default()
     })
     .collect()
+}
+
+/// The palette's description for a command: the built-ins in Chinese when
+/// the UI is Chinese, else the engine's own text.
+pub(crate) fn command_description(candidate: &CommandCandidate) -> String {
+    if lang::is_zh() && candidate.marker.is_none() {
+        let zh = match candidate.command.as_str() {
+            "/help" => "查看所有命令",
+            "/login" => "登录 LynShen 或其他服务商",
+            "/login-paste" => "粘贴回调地址完成登录",
+            "/usage" => "套餐、余额、用量和最近调用",
+            "/new" => "开始新会话",
+            "/model" => "切换模型和思考强度",
+            "/effort" => "切换思考强度",
+            "/subagents" => "子智能体可以用的模型",
+            "/tree" => "查看对话分支",
+            "/trust" => "信任这个项目的技能和钩子",
+            "/resume" => "恢复之前的会话",
+            "/rewind" => "回到更早的一轮，对话和文件一起",
+            "/approve" => "回应批准请求，可以只批准部分改动",
+            "/plan" => "查看等待批准的计划",
+            "/permissions" => "查看或切换批准模式",
+            "/sandbox" => "查看或切换命令沙箱",
+            "/style" => "查看或切换回答风格",
+            "/context" => "上下文占用",
+            "/goal" => "设定会话目标",
+            "/doctor" => "检查运行环境",
+            "/skills" => "管理技能",
+            "/pin" => "本会话固定使用某个技能",
+            "/image" => "给下一条消息附图",
+            "/compact" => "立即压缩上下文",
+            "/quit" | "/exit" => "退出",
+            "/config" => "查看当前配置",
+            "/checkout" => "切换到对话的某个节点",
+            "/fork" => "从某个节点分叉",
+            "/delete" => "删除分支",
+            "/mcp" => "管理 MCP 服务器",
+            "/android" => "操作安卓手机",
+            "/stats" => "上下文统计",
+            _ => "",
+        };
+        if !zh.is_empty() {
+            return zh.to_string();
+        }
+    }
+    candidate.description.clone()
+}
+
+/// The palette's tag for a command's source.
+pub(crate) fn marker_label(marker: &str) -> String {
+    if !lang::is_zh() {
+        return marker.to_string();
+    }
+    match marker {
+        "SKILL" => "技能",
+        "PROJ" => "项目",
+        "CMD" => "自定义",
+        other => other,
+    }
+    .to_string()
 }
 
 fn format_plan_summary(items: &[lynshen_agent_core::PlanItem]) -> String {
@@ -402,15 +506,6 @@ fn scroll_page_size() -> usize {
         .unwrap_or(10)
 }
 
-fn pad_to_width(text: &str, width: usize) -> String {
-    let visible_width = UnicodeWidthStr::width(text);
-    if visible_width >= width {
-        text.to_string()
-    } else {
-        format!("{}{}", text, " ".repeat(width - visible_width))
-    }
-}
-
 pub trait TuiRuntime {
     fn startup_events(&self) -> Vec<AgentEvent>;
     fn model_status_event(&self) -> AgentEvent;
@@ -434,6 +529,9 @@ pub struct TuiApp<R> {
     /// Active drag selection over the whole screen, in cell coordinates.
     /// Releasing the drag copies the text via OSC52.
     mouse_selection: Option<TextSelection>,
+    /// The first ctrl+c on an idle, empty composer: a second one within
+    /// `QUIT_CONFIRM_WINDOW` quits.
+    quit_armed_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -509,6 +607,7 @@ impl<R: TuiRuntime> TuiApp<R> {
             local_shell: LocalShellRunner::default(),
             scroll_offset: 0,
             mouse_selection: None,
+            quit_armed_at: None,
         };
         let events = app.runtime.startup_events();
         app.apply_events(events);
@@ -525,13 +624,18 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     pub fn run(mut self) -> io::Result<()> {
         let _guard = TerminalGuard::enter()?;
+        // In raw mode and before any input is read: the background query
+        // reads the terminal's reply from stdin.
+        theme::install(theme::detect());
         let mut renderer = TerminalRenderer::new()?;
+        let mut account = AccountFetcher::start();
         let git_tracker = GitStatusTracker::start(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         );
         let now = Instant::now();
         let mut frames = FrameScheduler::new(now);
         let mut next_progress_at = now + PROGRESS_INTERVAL;
+        let mut turn_was_active = false;
 
         loop {
             let now = Instant::now();
@@ -552,6 +656,21 @@ impl<R: TuiRuntime> TuiApp<R> {
             for result in self.local_shell.poll() {
                 self.state.finish_local_shell(result);
                 frames.request_now(now);
+            }
+            if let Some(lookup) = account.poll() {
+                if self.state.set_account(lookup.into()) {
+                    frames.request_now(now);
+                }
+            }
+            // The balance moves with each turn: look it up again once a turn
+            // ends (at most every ACCOUNT_REFRESH_INTERVAL).
+            let active = self.state.activity.is_active();
+            if turn_was_active && !active {
+                account.mark_turn();
+            }
+            turn_was_active = active;
+            if !active {
+                account.refresh_if_stale(now);
             }
 
             if self.state.activity.is_active() && now >= next_progress_at {
@@ -588,6 +707,14 @@ impl<R: TuiRuntime> TuiApp<R> {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             let quit = self.handle_key_at(key.code, key.modifiers, event_now);
                             frames.request_now(event_now);
+                            if self.quit_armed_at.is_some() {
+                                // Clears the "press again" notice when the window ends.
+                                frames.request_in(
+                                    event_now,
+                                    QUIT_CONFIRM_WINDOW + Duration::from_millis(20),
+                                );
+                            }
+
                             if self.paste_burst.is_active() {
                                 frames.request_in(event_now, paste_burst_render_delay());
                             }
@@ -632,7 +759,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                                     // thinking header toggles the block.
                                     Some(sel) if sel.is_empty() => {
                                         if let Some(index) = renderer.clickable_at(sel.anchor.0) {
-                                            self.state.toggle_reasoning_collapsed(index);
+                                            self.state.toggle_item(index);
                                             frames.request_now(event_now);
                                         }
                                     }
@@ -659,10 +786,22 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn handle_key_at(&mut self, code: KeyCode, modifiers: KeyModifiers, now: Instant) -> bool {
         self.flush_paste_burst_if_due(now);
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        if !(ctrl && code == KeyCode::Char('c')) {
+            self.quit_armed_at = None;
+        }
 
         if self.state.picker_view.is_some() {
             self.flush_paste_burst_before_non_plain_input();
             return self.handle_picker_key(code, modifiers);
+        }
+
+        // The shortcut sheet closes on any key; esc and `?` only close it.
+        if self.state.show_help {
+            self.state.show_help = false;
+            if matches!(code, KeyCode::Esc | KeyCode::Char('?')) {
+                return false;
+            }
         }
 
         // Scrolling the transcript is a transient browse mode: any other interaction
@@ -670,16 +809,41 @@ impl<R: TuiRuntime> TuiApp<R> {
         if !matches!(code, KeyCode::PageUp | KeyCode::PageDown) {
             self.scroll_offset = 0;
         }
+        if !matches!(code, KeyCode::Up | KeyCode::Down) {
+            self.state.end_history_browse();
+        }
 
         match code {
-            KeyCode::Char('c') | KeyCode::Char('q')
-                if modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                true
+            KeyCode::Char('q') if ctrl => true,
+            KeyCode::Char('c') if ctrl => self.handle_ctrl_c(now),
+            KeyCode::Char('d') if ctrl => {
+                self.flush_paste_burst_before_non_plain_input();
+                self.input.text().is_empty() && !self.state.activity.is_active()
             }
-            KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('o') if ctrl => {
+                self.flush_paste_burst_before_non_plain_input();
+                self.state.toggle_expand_tools();
+                false
+            }
+            KeyCode::Char('j') if ctrl => {
+                self.flush_paste_burst_before_non_plain_input();
+                self.input.push_char('\n');
+                self.state.completion_index = 0;
+                false
+            }
+            KeyCode::Char('t') if ctrl => {
                 self.flush_paste_burst_before_non_plain_input();
                 self.cycle_reasoning_effort();
+                false
+            }
+            // `?` on an empty composer opens the shortcut sheet instead of
+            // typing (while a paste streams in, it is just text).
+            KeyCode::Char('?')
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self.input.text().is_empty()
+                    && !self.paste_burst.is_active() =>
+            {
+                self.state.show_help = true;
                 false
             }
             KeyCode::Char(ch)
@@ -713,25 +877,31 @@ impl<R: TuiRuntime> TuiApp<R> {
             KeyCode::Up => {
                 self.flush_paste_burst_before_non_plain_input();
                 let count = self.completion_rows_len();
+                let shift = modifiers.contains(KeyModifiers::SHIFT);
                 if count > 0 {
                     self.state.completion_index = (self.state.completion_index + count - 1) % count;
                 } else if self.input.text().is_empty() && !self.state.pending_messages.is_empty() {
                     // The last queued message comes back to edit (`unqueued`).
                     let events = self.runtime.unqueue_last();
                     self.apply_events(events);
+                } else if shift || !self.input.cursor_on_first_line() {
+                    self.input.move_up(shift);
                 } else {
-                    self.input.move_up(modifiers.contains(KeyModifiers::SHIFT));
+                    // On the first line: the previous sent message.
+                    self.state.history_previous(&mut self.input);
                 }
                 false
             }
             KeyCode::Down => {
                 self.flush_paste_burst_before_non_plain_input();
                 let count = self.completion_rows_len();
+                let shift = modifiers.contains(KeyModifiers::SHIFT);
                 if count > 0 {
                     self.state.completion_index = (self.state.completion_index + 1) % count;
+                } else if shift || !self.input.cursor_on_last_line() {
+                    self.input.move_down(shift);
                 } else {
-                    self.input
-                        .move_down(modifiers.contains(KeyModifiers::SHIFT));
+                    self.state.history_next(&mut self.input);
                 }
                 false
             }
@@ -854,6 +1024,8 @@ impl<R: TuiRuntime> TuiApp<R> {
                     return false;
                 }
 
+                self.state.remember_sent(&submitted);
+
                 // `!command` is a local shell escape: run it on this machine,
                 // never send it to the model.
                 if let Some(command) = local_shell_command(&submitted) {
@@ -890,6 +1062,15 @@ impl<R: TuiRuntime> TuiApp<R> {
             .filter(|picker| picker.prompt.is_some())
         {
             picker.push_prompt_str(text);
+            return;
+        }
+        if let Some(picker) = self
+            .state
+            .picker_view
+            .as_mut()
+            .filter(|picker| picker.filterable())
+        {
+            picker.push_filter_str(text);
             return;
         }
         // A pasted (or drag-and-dropped) image file path is attached directly
@@ -952,11 +1133,8 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn handle_picker_prompt_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         match code {
-            KeyCode::Char('c') | KeyCode::Char('q')
-                if modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                true
-            }
+            KeyCode::Char('q') if modifiers.contains(KeyModifiers::CONTROL) => true,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => self.close_picker(),
             KeyCode::Esc => {
                 match self.state.picker_view.as_mut() {
                     // The paste prompt is the whole picker — esc closes it;
@@ -1020,15 +1198,75 @@ impl<R: TuiRuntime> TuiApp<R> {
             return self.handle_picker_prompt_key(code, modifiers);
         }
 
+        let filterable = self
+            .state
+            .picker_view
+            .as_ref()
+            .is_some_and(PickerState::filterable);
+        let confirm = self.state.picker_view.as_ref().is_some_and(|picker| {
+            matches!(
+                picker.mode,
+                PickerMode::Approval | PickerMode::Trust | PickerMode::Plan
+            )
+        });
+        let plain = !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match code {
-            KeyCode::Char('c') | KeyCode::Char('q')
-                if modifiers.contains(KeyModifiers::CONTROL) =>
+            KeyCode::Char('q') if modifiers.contains(KeyModifiers::CONTROL) => true,
+            // Esc (or ctrl+c) closes the picker; an approval closed this way
+            // is denied, as its hint says.
+            // Esc first clears a typed filter, then closes.
+            KeyCode::Esc
+                if self
+                    .state
+                    .picker_view
+                    .as_ref()
+                    .is_some_and(|picker| !picker.filter.is_empty()) =>
             {
-                true
+                if let Some(picker) = self.state.picker_view.as_mut() {
+                    picker.clear_filter();
+                }
+                false
             }
-            KeyCode::Esc => {
-                self.state.picker_view = None;
-                self.state.show_next_queued_approval();
+            KeyCode::Esc => self.close_picker(),
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => self.close_picker(),
+            KeyCode::Char(ch @ '1'..='9') if confirm && plain => {
+                let number = ch.to_digit(10).unwrap_or(0) as usize;
+                let selected = self
+                    .state
+                    .picker_view
+                    .as_mut()
+                    .is_some_and(|picker| picker.select_number(number));
+                if selected {
+                    return self.handle_picker_key(KeyCode::Enter, KeyModifiers::empty());
+                }
+                false
+            }
+            KeyCode::Backspace if filterable => {
+                if let Some(picker) = self.state.picker_view.as_mut() {
+                    picker.pop_filter_char();
+                }
+                false
+            }
+            KeyCode::Char(ch) if filterable && plain => {
+                if let Some(picker) = self.state.picker_view.as_mut() {
+                    picker.push_filter_char(ch);
+                }
+                false
+            }
+            KeyCode::Left | KeyCode::Right
+                if self
+                    .state
+                    .picker_view
+                    .as_ref()
+                    .is_some_and(|picker| picker.mode == PickerMode::Model) =>
+            {
+                if let Some(picker) = self.state.picker_view.as_mut() {
+                    if code == KeyCode::Left {
+                        picker.cycle_effort_back();
+                    } else {
+                        picker.cycle_effort();
+                    }
+                }
                 false
             }
             KeyCode::Up => {
@@ -1130,8 +1368,60 @@ impl<R: TuiRuntime> TuiApp<R> {
         }
     }
 
+    /// Closes the open picker; an approval closed this way is answered
+    /// "deny".
+    fn close_picker(&mut self) -> bool {
+        let deny = self
+            .state
+            .picker_view
+            .as_ref()
+            .and_then(PickerState::deny_command);
+        self.state.picker_view = None;
+        if let Some(command) = deny {
+            let (_, events) = self.runtime.handle_command(&command);
+            self.apply_events(events);
+        }
+        self.state.show_next_queued_approval();
+        false
+    }
+
+    /// ctrl+c: interrupts a running turn, else clears the draft, else arms
+    /// quitting; a second press within `QUIT_CONFIRM_WINDOW` quits.
+    fn handle_ctrl_c(&mut self, now: Instant) -> bool {
+        self.flush_paste_burst_before_non_plain_input();
+        if self.state.activity.is_active() {
+            self.quit_armed_at = None;
+            let events = self.runtime.interrupt();
+            self.apply_events(events);
+            return false;
+        }
+        if !self.input.text().is_empty() {
+            self.quit_armed_at = None;
+            self.input.clear();
+            self.state.completion_index = 0;
+            return false;
+        }
+        if self
+            .quit_armed_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= QUIT_CONFIRM_WINDOW)
+        {
+            return true;
+        }
+        self.quit_armed_at = Some(now);
+        false
+    }
+
+    /// The notice above the composer while a ctrl+c waits for its second
+    /// press.
+    fn quit_notice(&self, now: Instant) -> Option<&'static str> {
+        self.quit_armed_at
+            .filter(|at| now.saturating_duration_since(*at) <= QUIT_CONFIRM_WINDOW)
+            .map(|_| lang::t("再按一次 ctrl+c 退出", "press ctrl+c again to quit"))
+    }
+
     fn build_document(&mut self, width: usize, now: Instant) -> UiDocument {
-        self.state.build_document(&self.input, width, now)
+        let notice = self.quit_notice(now);
+        self.state.build_document(&self.input, width, now, notice)
     }
 
     fn clamp_completion_index(&mut self) {
@@ -1307,99 +1597,111 @@ impl ActivityState {
     }
 
     fn progress(&self, now: Instant, thinking_tokens: u64) -> Option<ProgressState> {
-        let phase_started_at = self.phase_started_at.or(self.turn_started_at)?;
-        let elapsed = now.saturating_duration_since(phase_started_at);
-        match self.kind {
-            ActivityKind::Idle => None,
-            ActivityKind::Connecting => Some(ProgressState {
-                color: gradient_color(
-                    elapsed.as_secs_f32() / 10.0,
-                    (255, 255, 255),
-                    (255, 210, 0),
-                    (255, 60, 60),
-                ),
-                preset: SpinnerPreset::Line,
-                label: format!("connecting {:.1}s", elapsed.as_secs_f32()),
-                step: 1,
-            }),
-            ActivityKind::Thinking => {
-                let token_suffix = if thinking_tokens > 0 {
-                    format!(" ({thinking_tokens} tokens)")
-                } else {
-                    String::new()
-                };
-                Some(ProgressState {
-                    color: gradient_color(
-                        elapsed.as_secs_f32() / 30.0,
-                        (160, 130, 230),
-                        (140, 110, 220),
-                        (120, 90, 210),
-                    ),
-                    preset: SpinnerPreset::Pulse,
-                    label: format!("thinking {:.1}s{token_suffix}", elapsed.as_secs_f32()),
-                    step: 1,
-                })
-            }
-            ActivityKind::Compacting => Some(ProgressState {
-                color: (90, 200, 220),
-                preset: SpinnerPreset::Pulse,
-                label: format!(
-                    "compacting context [{}] {} tok {:.1}s",
-                    indeterminate_bar(self.animation_tick, 14),
-                    self.estimated_output_tokens,
-                    elapsed.as_secs_f32()
-                ),
-                step: 1,
-            }),
-            ActivityKind::Reconnecting { attempt } => Some(ProgressState {
-                color: (255, 60, 60),
-                preset: SpinnerPreset::Pulse,
-                label: format!("reconnecting attempt {attempt}"),
-                step: 2,
-            }),
+        let turn_started_at = self.turn_started_at.or(self.phase_started_at)?;
+        let phase_started_at = self.phase_started_at.unwrap_or(turn_started_at);
+        let elapsed = now.saturating_duration_since(turn_started_at);
+        let phase_elapsed = now.saturating_duration_since(phase_started_at);
+        let mut stalled = false;
+        let phase = match self.kind {
+            ActivityKind::Idle => return None,
+            ActivityKind::Connecting => lang::t("连接中", "Connecting").to_string(),
+            ActivityKind::Thinking => lang::t("思考中", "Thinking").to_string(),
+            ActivityKind::Compacting => lang::t("压缩上下文", "Compacting context").to_string(),
+            ActivityKind::Reconnecting { attempt } => match lang::lang() {
+                lang::Lang::Zh => format!("重连中（第 {attempt} 次）"),
+                lang::Lang::En => format!("Reconnecting (attempt {attempt})"),
+            },
             ActivityKind::Output => {
-                let stalled_for = self
+                // No new text for a while: the reply stalled upstream.
+                let quiet_for = self
                     .last_delta_at
                     .map(|last| now.saturating_duration_since(last))
-                    .unwrap_or_default();
-                let output_elapsed = elapsed.as_secs_f32().max(0.1);
-                let tokens_per_sec = self.estimated_output_tokens as f32 / output_elapsed;
-                let step = 1 + (tokens_per_sec / 8.0).floor().clamp(0.0, 5.0) as usize;
-                Some(ProgressState {
-                    color: gradient_color(
-                        stalled_for.as_secs_f32() / 8.0,
-                        (70, 220, 110),
-                        (255, 210, 0),
-                        (255, 60, 60),
-                    ),
-                    preset: SpinnerPreset::Dots,
-                    label: format!("output {:.1} tok/s", tokens_per_sec),
-                    step,
-                })
+                    .unwrap_or(phase_elapsed);
+                if quiet_for >= STALL_AFTER {
+                    stalled = true;
+                    match lang::lang() {
+                        lang::Lang::Zh => format!("等待响应 {} 秒", quiet_for.as_secs()),
+                        lang::Lang::En => format!("Waiting for the reply {}s", quiet_for.as_secs()),
+                    }
+                } else {
+                    lang::t("输出中", "Writing").to_string()
+                }
             }
-            ActivityKind::Tool => Some(ProgressState {
-                color: (255, 210, 0),
-                preset: SpinnerPreset::Scan,
-                label: "tool running".to_string(),
-                step: 1,
-            }),
+            ActivityKind::Tool => lang::t("运行工具", "Running a tool").to_string(),
+        };
+        let mut detail = ui_builder::format_turn_elapsed(elapsed.as_secs());
+        let tokens = self.estimated_output_tokens + thinking_tokens;
+        if tokens > 0 {
+            detail.push_str(&format!(" · ↓ {} tokens", format_token_count(tokens)));
         }
+        Some(ProgressState {
+            phase,
+            detail,
+            stalled,
+        })
     }
 }
 
+/// What the progress row says: the phase, the elapsed time and tokens, and
+/// whether the reply stalled (the spinner turns to the attention colour).
 struct ProgressState {
-    color: (u8, u8, u8),
-    preset: SpinnerPreset,
-    label: String,
-    step: usize,
+    phase: String,
+    detail: String,
+    stalled: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SpinnerPreset {
-    Line,
-    Dots,
-    Pulse,
-    Scan,
+/// Looks the LynShen account up off the UI thread: at startup, and again
+/// after a turn when the last lookup is older than the refresh interval.
+struct AccountFetcher {
+    rx: std::sync::mpsc::Receiver<AccountLookup>,
+    tx: std::sync::mpsc::Sender<AccountLookup>,
+    last_started: Instant,
+    in_flight: bool,
+    turn_since: bool,
+}
+
+impl AccountFetcher {
+    fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut fetcher = Self {
+            rx,
+            tx,
+            last_started: Instant::now(),
+            in_flight: false,
+            turn_since: false,
+        };
+        fetcher.spawn(Instant::now());
+        fetcher
+    }
+
+    fn spawn(&mut self, now: Instant) {
+        let tx = self.tx.clone();
+        self.in_flight = true;
+        self.turn_since = false;
+        self.last_started = now;
+        std::thread::spawn(move || {
+            let _ = tx.send(lynshen_agent_core::lynshen_account());
+        });
+    }
+
+    fn poll(&mut self) -> Option<AccountLookup> {
+        let lookup = self.rx.try_recv().ok()?;
+        self.in_flight = false;
+        Some(lookup)
+    }
+
+    fn mark_turn(&mut self) {
+        self.turn_since = true;
+    }
+
+    fn refresh_if_stale(&mut self, now: Instant) {
+        if self.turn_since
+            && !self.in_flight
+            && now.saturating_duration_since(self.last_started) >= ACCOUNT_REFRESH_INTERVAL
+        {
+            self.spawn(now);
+        }
+    }
 }
 
 impl TerminalGuard {
@@ -1533,46 +1835,13 @@ pub(crate) fn extract_cursor(lines: &[UiLine]) -> Option<CursorTarget> {
     None
 }
 
-pub(crate) fn spinner_char(preset: SpinnerPreset, tick: usize, step: usize) -> &'static str {
-    const LINE: &[&str] = &["-", "\\", "|", "/"];
-    const DOTS: &[&str] = &[".", "o", "O", "o"];
-    const PULSE: &[&str] = &["+", "x", "*", "x"];
-    const SCAN: &[&str] = &["<", "^", ">", "v"];
-
-    let chars = match preset {
-        SpinnerPreset::Line => LINE,
-        SpinnerPreset::Dots => DOTS,
-        SpinnerPreset::Pulse => PULSE,
-        SpinnerPreset::Scan => SCAN,
-    };
-    chars[(tick * step.max(1)) % chars.len()]
-}
-
-fn gradient_color(
-    value: f32,
-    start: (u8, u8, u8),
-    middle: (u8, u8, u8),
-    end: (u8, u8, u8),
-) -> (u8, u8, u8) {
-    let value = value.clamp(0.0, 1.0);
-    if value <= 0.5 {
-        interpolate_color(start, middle, value * 2.0)
-    } else {
-        interpolate_color(middle, end, (value - 0.5) * 2.0)
-    }
-}
-
-fn interpolate_color(from: (u8, u8, u8), to: (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
-    let amount = amount.clamp(0.0, 1.0);
-    (
-        interpolate_channel(from.0, to.0, amount),
-        interpolate_channel(from.1, to.1, amount),
-        interpolate_channel(from.2, to.2, amount),
-    )
-}
-
-fn interpolate_channel(from: u8, to: u8, amount: f32) -> u8 {
-    (from as f32 + (to as f32 - from as f32) * amount).round() as u8
+/// One frame of the progress spinner: braille dots, or an ASCII line where
+/// the terminal's font lacks braille.
+pub(crate) fn spinner_char(tick: usize) -> &'static str {
+    const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const ASCII: &[&str] = &["-", "\\", "|", "/"];
+    let frames = if theme::rich_glyphs() { BRAILLE } else { ASCII };
+    frames[tick % frames.len()]
 }
 
 fn truncate_to_width(text: &str, max_width: usize) -> String {
@@ -1629,43 +1898,27 @@ pub(crate) fn truncate_line_spans(line: &Line<'static>, max: usize) -> Line<'sta
     truncated
 }
 
-/// An indeterminate progress bar that fills and drains across `width` cells,
-/// animated by the frame tick (compaction has no known total to measure against).
-fn indeterminate_bar(tick: usize, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let cycle = width.saturating_mul(2).max(1);
-    let phase = tick % cycle;
-    let head = if phase < width { phase } else { cycle - phase };
-    (0..width)
-        .map(|index| if index <= head { '=' } else { ' ' })
-        .collect()
-}
-
-/// Fallback style for a line kind — spans keep their own style where set.
-/// crossterm maps `White`/`DarkGray` to `38;5;15`/`38;5;8`, the bright-white and
-/// gray slots this TUI used as raw `97`/`90`.
+/// Fallback style for a line kind; spans keep their own style where set.
+/// Text uses the terminal's own colour; fills only where the theme draws
+/// them.
 pub(crate) fn kind_style(kind: UiKind) -> Style {
+    let fill = |surface| match theme::surface(surface) {
+        Some(color) => Style::new().bg(color),
+        None => Style::new(),
+    };
     match kind {
-        // Brand/active rows share the startup accent hue.
-        UiKind::Brand => STARTUP_ACCENT,
-        UiKind::User | UiKind::Assistant | UiKind::ToolHeader => Style::new().fg(Color::White),
-        UiKind::Selected => Style::new()
-            .fg(STARTUP_ACCENT.fg.unwrap_or(Color::White))
-            .add_modifier(Modifier::BOLD),
-        UiKind::Tool | UiKind::System | UiKind::Status => Style::new().fg(Color::DarkGray),
-        UiKind::BottomStatus => Style::new().fg(Color::White),
-        UiKind::Error => Style::new().fg(Color::Red),
-        UiKind::Input => Style::new().fg(Color::Rgb(224, 226, 232)),
-        UiKind::TreeDirectory => Style::new().fg(Color::Yellow),
-        UiKind::DiffAdd => Style::new()
-            .fg(Color::Rgb(170, 220, 170))
-            .bg(Color::Rgb(28, 70, 38)),
-        UiKind::DiffRemove => Style::new()
-            .fg(Color::Rgb(230, 150, 145))
-            .bg(Color::Rgb(85, 38, 32)),
-        UiKind::DiffHeader => Style::new().fg(Color::Cyan),
+        UiKind::User => fill(theme::Surface::User),
+        UiKind::Selected | UiKind::CandidateSelected => fill(theme::Surface::Selected),
+        UiKind::Assistant
+        | UiKind::ToolHeader
+        | UiKind::System
+        | UiKind::BottomStatus
+        | UiKind::Input
+        | UiKind::Candidate => Style::new(),
+        UiKind::Tool | UiKind::Status => theme::dim(),
+        UiKind::Error => theme::err(),
+        UiKind::DiffAdd => theme::add(),
+        UiKind::DiffRemove => theme::del(),
     }
 }
 

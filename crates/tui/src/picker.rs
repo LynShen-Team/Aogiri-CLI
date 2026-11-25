@@ -2,8 +2,6 @@ use std::collections::HashSet;
 
 use lynshen_agent_core::{LoginProviderView, ModelOptionView, SessionListItemView, TreeNodeView};
 
-use crate::format_token_count;
-
 #[derive(Debug, Clone)]
 pub(crate) struct PickerState {
     pub(crate) rows: Vec<PickerRow>,
@@ -19,6 +17,27 @@ pub(crate) struct PickerState {
     pub(crate) prompt: Option<TreePrompt>,
     /// Login-mode rows that need a pasted API key instead of a browser flow.
     key_rows: HashSet<String>,
+    /// Typed filter of a list picker (model, session, rewind, login).
+    pub(crate) filter: String,
+    /// The unfiltered rows of a list picker once a filter was typed.
+    all_rows: Vec<PickerRow>,
+    /// A dim line under a confirmation's context (where, why).
+    pub(crate) detail: Option<String>,
+}
+
+/// An approval request as the picker shows it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ApprovalView {
+    pub(crate) call_id: String,
+    pub(crate) name: String,
+    pub(crate) summary: String,
+    pub(crate) command: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) reason: Option<String>,
+    /// The command prefix "allow for this session" remembers.
+    pub(crate) prefix: Option<String>,
+    pub(crate) subagent: Option<String>,
+    pub(crate) hunks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +109,9 @@ impl PickerState {
             context: None,
             prompt: None,
             key_rows: HashSet::new(),
+            filter: String::new(),
+            all_rows: Vec::new(),
+            detail: None,
         }
     }
 
@@ -120,6 +142,9 @@ impl PickerState {
             context: None,
             prompt: None,
             key_rows: HashSet::new(),
+            filter: String::new(),
+            all_rows: Vec::new(),
+            detail: None,
         }
     }
 
@@ -149,6 +174,9 @@ impl PickerState {
             context: None,
             prompt: None,
             key_rows: HashSet::new(),
+            filter: String::new(),
+            all_rows: Vec::new(),
+            detail: None,
         }
     }
 
@@ -173,9 +201,9 @@ impl PickerState {
                 active: model.active,
                 has_children: false,
                 detail: format!(
-                    "ctx {} out {}",
-                    format_token_count(model.context_window),
-                    format_token_count(model.max_output_tokens)
+                    "{} {}",
+                    crate::format_context_window(model.context_window),
+                    crate::lang::t("上下文", "context")
                 ),
                 reasoning_efforts: model.reasoning_efforts,
             })
@@ -191,6 +219,9 @@ impl PickerState {
             context: None,
             prompt: None,
             key_rows: HashSet::new(),
+            filter: String::new(),
+            all_rows: Vec::new(),
+            detail: None,
         }
     }
 
@@ -226,6 +257,9 @@ impl PickerState {
             context: None,
             prompt: None,
             key_rows,
+            filter: String::new(),
+            all_rows: Vec::new(),
+            detail: None,
         }
     }
 
@@ -246,11 +280,26 @@ impl PickerState {
                 input: String::new(),
             }),
             key_rows: HashSet::new(),
+            filter: String::new(),
+            all_rows: Vec::new(),
+            detail: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn approval(call_id: String, name: String, summary: String) -> Self {
-        let row = |suffix: &str, label: String| PickerRow {
+        Self::approval_with(ApprovalView {
+            call_id,
+            name,
+            summary,
+            ..ApprovalView::default()
+        })
+    }
+
+    pub(crate) fn approval_with(view: ApprovalView) -> Self {
+        use crate::lang::t;
+        let call_id = view.call_id.clone();
+        let row = |suffix: &str, label: String, detail: String| PickerRow {
             id: format!("{call_id} {suffix}"),
             parent_id: None,
             depth: 0,
@@ -258,14 +307,64 @@ impl PickerState {
             label,
             active: false,
             has_children: false,
-            detail: String::new(),
+            detail,
             reasoning_efforts: Vec::new(),
         };
+        let scope = match &view.prefix {
+            Some(prefix) => match crate::lang::lang() {
+                crate::lang::Lang::Zh => format!("{prefix} 开头的命令"),
+                crate::lang::Lang::En => format!("commands starting with {prefix}"),
+            },
+            None => view.name.clone(),
+        };
         let rows = vec![
-            row("allow once", "Allow once".to_string()),
-            row("allow always", format!("Allow {name} for this session")),
-            row("deny", "Deny".to_string()),
+            row(
+                "allow once",
+                t("允许这一次", "Allow once").to_string(),
+                String::new(),
+            ),
+            row(
+                "allow always",
+                t("本会话内都允许", "Allow for this session").to_string(),
+                scope,
+            ),
+            row("deny", t("拒绝", "Deny").to_string(), String::new()),
         ];
+        let title = match view.name.as_str() {
+            "bash" | "exec_command" | "execute" | "shell_command" | "write_stdin" => {
+                t("运行命令", "Run a command").to_string()
+            }
+            "edit" | "str_replace" | "hashline_edit" | "apply_patch" => {
+                t("修改文件", "Edit a file").to_string()
+            }
+            "write" => t("写入文件", "Write a file").to_string(),
+            "web_fetch" => t("访问网页", "Fetch a page").to_string(),
+            name => match crate::lang::lang() {
+                crate::lang::Lang::Zh => format!("使用工具 {name}"),
+                crate::lang::Lang::En => format!("Use {name}"),
+            },
+        };
+        let context = view
+            .command
+            .clone()
+            .filter(|command| !command.trim().is_empty())
+            .or_else(|| (!view.summary.is_empty()).then(|| view.summary.clone()));
+        let mut detail = Vec::new();
+        if let Some(cwd) = view.cwd.as_ref().filter(|cwd| !cwd.is_empty()) {
+            detail.push(crate::compact_home_path(cwd));
+        }
+        if let Some(reason) = view.reason.as_ref().filter(|reason| !reason.is_empty()) {
+            detail.push(format!("{}{reason}", t("理由：", "reason: ")));
+        }
+        if let Some(agent) = &view.subagent {
+            detail.push(format!("{} {agent}", t("子智能体", "subagent")));
+        }
+        if view.hunks > 0 {
+            detail.push(match crate::lang::lang() {
+                crate::lang::Lang::Zh => format!("{} 处改动", view.hunks),
+                crate::lang::Lang::En => format!("{} hunks", view.hunks),
+            });
+        }
         Self {
             rows,
             selected: 0,
@@ -273,10 +372,13 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
-            title: Some(format!("Approve {name}")),
-            context: (!summary.is_empty()).then_some(summary),
+            title: Some(title),
+            context,
             prompt: None,
             key_rows: HashSet::new(),
+            filter: String::new(),
+            all_rows: Vec::new(),
+            detail: (!detail.is_empty()).then(|| detail.join(" · ")),
         }
     }
 
@@ -296,14 +398,29 @@ impl PickerState {
         let rows = vec![
             row(
                 "approve auto-edit",
-                "Approve, run with edits allowed (auto-edit)",
+                crate::lang::t(
+                    "批准，允许它直接改文件",
+                    "Approve, run with edits allowed (auto-edit)",
+                ),
             ),
             row(
                 "approve manual",
-                "Approve, run asking before each change (manual)",
+                crate::lang::t(
+                    "批准，每次改动前问我",
+                    "Approve, run asking before each change (manual)",
+                ),
             ),
-            row("approve auto", "Approve, run without asking (auto)"),
-            row("revise", "Revise: tell the agent what to change"),
+            row(
+                "approve auto",
+                crate::lang::t("批准，不再询问", "Approve, run without asking (auto)"),
+            ),
+            row(
+                "revise",
+                crate::lang::t(
+                    "修改：告诉它要改什么",
+                    "Revise: tell the agent what to change",
+                ),
+            ),
         ];
         Self {
             rows,
@@ -312,10 +429,13 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
-            title: Some("Proposed plan".to_string()),
+            title: Some(crate::lang::t("它提出了一个计划", "Proposed plan").to_string()),
             context: (!title.is_empty()).then_some(title),
             prompt: None,
             key_rows: HashSet::new(),
+            filter: String::new(),
+            all_rows: Vec::new(),
+            detail: None,
         }
     }
 
@@ -331,13 +451,25 @@ impl PickerState {
             detail,
             reasoning_efforts: Vec::new(),
         };
-        let mut rows = vec![row("yes", "Trust this folder", String::new())];
+        use crate::lang::t;
+        let mut rows = vec![row(
+            "yes",
+            t("信任这个目录", "Trust this folder"),
+            String::new(),
+        )];
         if let Some(root) = repo_root {
-            rows.push(row("repo", "Trust the whole repository", root));
+            rows.push(row(
+                "repo",
+                t("信任整个仓库", "Trust the whole repository"),
+                crate::compact_home_path(&root),
+            ));
         }
         rows.push(row(
             "no",
-            "Do not trust (project skills & hooks stay disabled)",
+            t(
+                "不信任（项目里的技能和钩子保持关闭）",
+                "Do not trust (project skills & hooks stay disabled)",
+            ),
             String::new(),
         ));
         Self {
@@ -347,10 +479,19 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
-            title: Some("Trust project?".to_string()),
-            context: Some(cwd),
+            title: Some(
+                t(
+                    "信任后会加载这个项目自带的技能和钩子",
+                    "Trusting loads this project's skills and hooks",
+                )
+                .to_string(),
+            ),
+            context: Some(crate::compact_home_path(&cwd)),
             prompt: None,
             key_rows: HashSet::new(),
+            filter: String::new(),
+            all_rows: Vec::new(),
+            detail: None,
         }
     }
 
@@ -487,6 +628,108 @@ impl PickerState {
                 self.selected_id().map(|id| format!("/plan {id} {label}"))
             }
         }
+    }
+
+    /// List pickers take a typed filter; the tree keeps its letter keys and
+    /// confirmations their digits.
+    pub(crate) fn filterable(&self) -> bool {
+        matches!(
+            self.mode,
+            PickerMode::Resume | PickerMode::Rewind | PickerMode::Model | PickerMode::Login
+        )
+    }
+
+    /// Rows before the filter.
+    pub(crate) fn total_rows(&self) -> usize {
+        if self.all_rows.is_empty() {
+            self.rows.len()
+        } else {
+            self.all_rows.len()
+        }
+    }
+
+    /// Characters of `label` the filter matched, for highlighting.
+    pub(crate) fn match_indices(&self, label: &str) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return Vec::new();
+        }
+        crate::fuzzy::fuzzy_match(label, &self.filter)
+            .map(|found| found.indices)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn push_filter_char(&mut self, ch: char) {
+        self.filter.push(ch);
+        self.apply_filter();
+    }
+
+    pub(crate) fn push_filter_str(&mut self, text: &str) {
+        self.filter
+            .extend(text.chars().filter(|ch| !ch.is_control()));
+        self.apply_filter();
+    }
+
+    pub(crate) fn clear_filter(&mut self) {
+        if !self.filter.is_empty() {
+            self.filter.clear();
+            self.apply_filter();
+        }
+    }
+
+    /// Returns false when the filter was already empty.
+    pub(crate) fn pop_filter_char(&mut self) -> bool {
+        if self.filter.pop().is_none() {
+            return false;
+        }
+        self.apply_filter();
+        true
+    }
+
+    fn apply_filter(&mut self) {
+        if self.all_rows.is_empty() {
+            self.all_rows = self.rows.clone();
+        }
+        let previous = self.selected_id();
+        self.rows = crate::fuzzy::rank(&self.all_rows, &self.filter, |row| row.label.as_str())
+            .into_iter()
+            .map(|(row, _)| row.clone())
+            .collect();
+        self.selected = if self.filter.is_empty() {
+            previous
+                .and_then(|id| self.rows.iter().position(|row| row.id == id))
+                .or_else(|| self.rows.iter().position(|row| row.active))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        self.sync_selected_model_efforts();
+    }
+
+    /// Digit keys on confirmations: selects row `number` (1-based).
+    pub(crate) fn select_number(&mut self, number: usize) -> bool {
+        if number == 0 || number > self.rows.len() {
+            return false;
+        }
+        self.selected = number - 1;
+        true
+    }
+
+    /// The command that answers an approval with "deny" (esc).
+    pub(crate) fn deny_command(&self) -> Option<String> {
+        if self.mode != PickerMode::Approval {
+            return None;
+        }
+        self.rows
+            .iter()
+            .find(|row| row.id.ends_with(" deny"))
+            .map(|row| format!("/approve {}", row.id))
+    }
+
+    pub(crate) fn cycle_effort_back(&mut self) {
+        if self.mode != PickerMode::Model || self.efforts.is_empty() {
+            return;
+        }
+        self.selected_effort = (self.selected_effort + self.efforts.len() - 1) % self.efforts.len();
     }
 
     pub(crate) fn move_previous(&mut self) {
