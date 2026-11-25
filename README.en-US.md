@@ -21,29 +21,51 @@ The command is `lynshen`, written in Rust. Start it in a project directory and a
 
 ## Installation
 
-| Platform | GitHub Releases file |
+**macOS / Linux:**
+
+```sh
+curl -fsSL https://software.lynshen.org/cli/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://software.lynshen.org/cli/install.ps1 | iex
+```
+
+The installer downloads the `lynshen` binary for your computer, checks it against the release's `SHA256SUMS`, puts it in `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows) and adds that folder to your PATH: on macOS and Linux in your shell's startup file (`~/.zshrc` for zsh, `~/.bashrc` and `~/.bash_profile` for bash, `config.fish` for fish), once, between `lynshen installer` marker lines; on Windows in your user PATH. It never needs sudo or administrator rights. When it's done, follow its last line: on macOS and Linux open a new terminal; on Windows the same window works right away. Then type `lynshen`.
+
+- **A specific version:** `curl -fsSL https://software.lynshen.org/cli/install.sh | bash -s -- --version 0.8.11`; on Windows set `$env:LYNSHEN_VERSION = '0.8.11'` first.
+- **Upgrade:** run the install command again, or `lynshen update`. The CLI also updates itself in the background (see "Updates" below).
+- **Uninstall:** `curl -fsSL https://software.lynshen.org/cli/install.sh | bash -s -- --uninstall`; on Windows `& ([scriptblock]::Create((irm https://software.lynshen.org/cli/install.ps1))) -Uninstall`. This removes `lynshen` and the PATH setting the installer added; settings and sessions in `~/.lynshen` stay.
+- `--no-modify-path` (`-NoModifyPath` on Windows) leaves PATH alone; `LYNSHEN_INSTALL_DIR` picks another folder.
+
+**Homebrew (macOS / Linux):**
+
+```sh
+brew install lynshen-team/tap/lynshen
+```
+
+Update with `brew upgrade lynshen`; `lynshen update` runs it for you.
+
+**npm:** `npm i -g @lynshen/cli` (Node.js 18 or later). npm installs the binary that matches your platform. An npm install does not replace itself in the background; `lynshen update` runs `npm i -g @lynshen/cli@latest` for you.
+
+> If your shell then says `lynshen: command not found`, npm's global folder isn't on your PATH. Run `npm prefix -g` to see where it is, and add the `bin` folder inside it to PATH (on Windows, the folder itself). For zsh, for example: `echo 'export PATH="'"$(npm prefix -g)"'/bin:$PATH"' >> ~/.zshrc`, then open a new terminal. Or use the installer above, which sets up PATH itself.
+
+**Aogiri desktop app:** it ships its own copy of the CLI (`~/.lynshen/bin`) and updates it with the app. Click "Use the lynshen command in a terminal" under Settings → Coding agents.
+
+**Manual download:** get the file from [GitHub Releases](https://github.com/LynShen-Team/Aogiri-CLI/releases/latest) or the LynShen software library (`https://software.lynshen.org/cli/<version>/<file>`) and put it in a folder on your PATH:
+
+| Platform | File |
 | --- | --- |
 | macOS (Apple silicon) | `lynshen-aarch64-apple-darwin` |
 | macOS (Intel) | `lynshen-x86_64-apple-darwin` |
 | Linux x64 | `lynshen-x86_64-unknown-linux-gnu` |
 | Windows x64 | `lynshen-x86_64-pc-windows-msvc.exe` |
 
-Download the file and put it in a directory on your PATH. For example, on an Apple silicon Mac:
+**Linux:** also install `bubblewrap` (for example `sudo apt install bubblewrap`). The agent's shell commands run in its sandbox and fail without it; LynShen never falls back to running them unsandboxed. The Linux build needs glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 or newer) and is x64 only.
 
-```sh
-curl -fLo lynshen https://github.com/LynShen-Team/Aogiri-CLI/releases/latest/download/lynshen-aarch64-apple-darwin
-chmod +x lynshen
-mkdir -p ~/.local/bin && mv lynshen ~/.local/bin/
-lynshen --version
-```
-
-The same files are in the LynShen software library: `https://software.lynshen.org/cli/<version>/<file>`.
-
-- **You already have the Aogiri desktop app:** it ships its own copy of the CLI (`~/.lynshen/bin`) and updates it with the app. Click "Use the lynshen command in a terminal" under Settings → Coding agents.
-- **Linux:** install `bubblewrap` first (for example `sudo apt install bubblewrap`). The agent's shell commands run in its sandbox and fail without it; LynShen never falls back to running them unsandboxed.
-- **npm:** `npm i -g @lynshen/cli` (Node.js 18 or later). npm installs the binary from the table above that matches your platform. An npm install does not replace itself in the background; `lynshen update` runs `npm i -g @lynshen/cli@latest` for you.
-
-**Updates.** `lynshen` (the TUI) and `lynshen serve` check the software library at startup. When a newer version exists, a release build downloads it in the background and replaces itself; it runs from the next start. A debug build only shows a notice. The version manifest is signed with Ed25519, and each file is checked against its sha256 before it replaces anything. Run `lynshen update` to update by hand. Set `"auto_update": false` in `~/.lynshen/config.json` to get only the notice. The desktop app's copy updates with the desktop app.
+**Updates.** `lynshen` (the TUI) and `lynshen serve` check the software library at startup. When a newer version exists, a release build installed by the installer or by hand downloads it in the background and replaces itself; it runs from the next start. A debug build only shows a notice. The version manifest is signed with Ed25519, and each file is checked against its sha256 before it replaces anything. Run `lynshen update` to update by hand. Set `"auto_update": false` in `~/.lynshen/config.json` to get only the notice. npm and Homebrew installs only show the notice, and `lynshen update` updates them through npm or brew; the desktop app's copy updates with the desktop app.
 
 ## Getting started
 

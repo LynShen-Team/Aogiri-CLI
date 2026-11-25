@@ -249,6 +249,8 @@ pub enum InstallChannel {
     Npm,
     /// The copy LynShen Desktop keeps in `~/.lynshen/bin` — it updates with the app.
     Desktop,
+    /// Inside a Homebrew keg (`…/Cellar/lynshen/<version>/`) — `brew upgrade` manages it.
+    Homebrew,
     /// Anything else: a release binary, cargo install, dev build.
     Other,
 }
@@ -270,6 +272,8 @@ fn channel_for_path(path: &str, desktop_bin: &str) -> InstallChannel {
     let desktop_bin = desktop_bin.replace('\\', "/");
     if path.contains("node_modules/@lynshen/") {
         InstallChannel::Npm
+    } else if path.contains("/Cellar/lynshen/") {
+        InstallChannel::Homebrew
     } else if !desktop_bin.is_empty()
         && path.starts_with(&format!("{}/", desktop_bin.trim_end_matches('/')))
     {
@@ -379,6 +383,21 @@ fn replace_binary(new: &Path, exe: &Path) -> Result<(), String> {
     }
 }
 
+/// Runs `brew upgrade lynshen` for a binary Homebrew installed (macOS and
+/// Linux; the tap is LynShen-Team/homebrew-tap). Replacing the file in the
+/// keg instead would leave Homebrew with the wrong version on record.
+pub fn run_brew_upgrade() -> Result<String, String> {
+    let status = Command::new("brew")
+        .args(["upgrade", "lynshen"])
+        .status()
+        .map_err(|error| format!("failed to run brew (is it on PATH?): {error}"))?;
+    if status.success() {
+        Ok("updated: restart lynshen to use the new version".to_string())
+    } else {
+        Err(format!("brew upgrade lynshen failed ({status})"))
+    }
+}
+
 /// Runs `npm i -g @lynshen/cli@latest` for an npm-installed binary.
 ///
 /// On Unix the foreground npm replaces the package files while this process
@@ -463,6 +482,21 @@ mod tests {
         assert_eq!(
             channel_for_path("/home/x/.lynshen/bin/lynshen", desktop),
             InstallChannel::Desktop
+        );
+        assert_eq!(
+            channel_for_path("/opt/homebrew/Cellar/lynshen/0.8.11/bin/lynshen", desktop),
+            InstallChannel::Homebrew
+        );
+        assert_eq!(
+            channel_for_path(
+                "/home/linuxbrew/.linuxbrew/Cellar/lynshen/0.8.11/bin/lynshen",
+                desktop
+            ),
+            InstallChannel::Homebrew
+        );
+        assert_eq!(
+            channel_for_path("/home/x/.local/bin/lynshen", desktop),
+            InstallChannel::Other
         );
         assert_eq!(
             channel_for_path(

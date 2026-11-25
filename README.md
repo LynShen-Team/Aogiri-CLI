@@ -21,29 +21,51 @@
 
 ## 安装
 
-| 平台 | GitHub Releases 文件 |
+**macOS / Linux：**
+
+```sh
+curl -fsSL https://software.lynshen.org/cli/install.sh | bash
+```
+
+**Windows（PowerShell）：**
+
+```powershell
+irm https://software.lynshen.org/cli/install.ps1 | iex
+```
+
+安装脚本下载适合这台电脑的 `lynshen`，按这个版本的 `SHA256SUMS` 校验后放进 `~/.local/bin`（Windows 是 `%USERPROFILE%\.local\bin`），再把这个目录加进 PATH：macOS 和 Linux 写进你的 shell 的启动文件（zsh 是 `~/.zshrc`，bash 是 `~/.bashrc` 和 `~/.bash_profile`，fish 是 `config.fish`），只写一次，前后有 `lynshen installer` 标记行；Windows 加进用户 PATH。不需要 sudo 或管理员权限。装完按最后一行提示做：macOS 和 Linux 开一个新终端，Windows 在当前窗口就能用，然后输入 `lynshen`。
+
+- **指定版本：** `curl -fsSL https://software.lynshen.org/cli/install.sh | bash -s -- --version 0.8.11`；Windows 先设 `$env:LYNSHEN_VERSION = '0.8.11'` 再运行安装命令。
+- **升级：** 再运行一次安装命令，或者 `lynshen update`。平时 CLI 也会在后台自己更新（见下面「更新」）。
+- **卸载：** `curl -fsSL https://software.lynshen.org/cli/install.sh | bash -s -- --uninstall`；Windows 是 `& ([scriptblock]::Create((irm https://software.lynshen.org/cli/install.ps1))) -Uninstall`。删掉 `lynshen` 和安装脚本加的 PATH 设置，`~/.lynshen` 里的设置和会话保留。
+- `--no-modify-path`（Windows 是 `-NoModifyPath`）不动 PATH；`LYNSHEN_INSTALL_DIR` 换安装目录。
+
+**Homebrew（macOS / Linux）：**
+
+```sh
+brew install lynshen-team/tap/lynshen
+```
+
+用 `brew upgrade lynshen` 更新，`lynshen update` 也会替你运行它。
+
+**npm：** `npm i -g @lynshen/cli`（需要 Node.js 18 以上），npm 会按平台装上对应的二进制。这样装的不在后台自动替换；`lynshen update` 会替你运行 `npm i -g @lynshen/cli@latest`。
+
+> 装完提示找不到 `lynshen` 命令（`command not found`），是因为 npm 的全局目录不在 PATH 里。运行 `npm prefix -g` 看它在哪，把输出目录下的 `bin` 加进 PATH（Windows 上是这个目录本身），例如 zsh：`echo 'export PATH="'"$(npm prefix -g)"'/bin:$PATH"' >> ~/.zshrc`，然后开一个新终端。也可以换用上面的安装脚本，它会自己处理 PATH。
+
+**Aogiri 桌面端：** 桌面端自带一份 CLI（`~/.lynshen/bin`），随应用更新。在「设置 → 编码智能体」里点「在终端中使用 lynshen 命令」即可。
+
+**手动下载：** 从 [GitHub Releases](https://github.com/LynShen-Team/Aogiri-CLI/releases/latest) 或 LynShen 软件库（`https://software.lynshen.org/cli/<版本>/<文件名>`）下载，放进 PATH 里的目录：
+
+| 平台 | 文件 |
 | --- | --- |
 | macOS（Apple 芯片） | `lynshen-aarch64-apple-darwin` |
 | macOS（Intel） | `lynshen-x86_64-apple-darwin` |
 | Linux x64 | `lynshen-x86_64-unknown-linux-gnu` |
 | Windows x64 | `lynshen-x86_64-pc-windows-msvc.exe` |
 
-下载后放进 PATH 里的目录。例如 Apple 芯片的 Mac：
+**Linux：** 另外安装 `bubblewrap`（例如 `sudo apt install bubblewrap`）。智能体的 shell 命令在它的沙箱里运行，没有它命令会失败；LynShen 不会退回到无沙箱运行。Linux 版需要 glibc 2.34 以上（Ubuntu 22.04、Debian 12、RHEL 9 或更新），只有 x64。
 
-```sh
-curl -fLo lynshen https://github.com/LynShen-Team/Aogiri-CLI/releases/latest/download/lynshen-aarch64-apple-darwin
-chmod +x lynshen
-mkdir -p ~/.local/bin && mv lynshen ~/.local/bin/
-lynshen --version
-```
-
-同样的文件也在 LynShen 软件库：`https://software.lynshen.org/cli/<版本>/<文件名>`。
-
-- **已经装了 Aogiri 桌面端：** 桌面端自带一份 CLI（`~/.lynshen/bin`），随应用更新。在「设置 → 编码智能体」里点「在终端中使用 lynshen 命令」即可。
-- **Linux：** 先安装 `bubblewrap`（例如 `sudo apt install bubblewrap`）。智能体的 shell 命令在它的沙箱里运行，没有它命令会失败；LynShen 不会退回到无沙箱运行。
-- **npm：** `npm i -g @lynshen/cli`（需要 Node.js 18 以上），npm 会按平台装上表里对应的二进制。这样装的不在后台自动替换；`lynshen update` 会替你运行 `npm i -g @lynshen/cli@latest`。
-
-**更新。** `lynshen`（TUI）和 `lynshen serve` 启动时检查软件库。有新版本时，release 构建会在后台下载并替换自己，下次启动生效；debug 构建只提示。版本清单有 Ed25519 签名，文件按 sha256 校验后才替换。手动更新用 `lynshen update`。在 `~/.lynshen/config.json` 里设 `"auto_update": false` 后只提示，不自动安装。桌面端那份 CLI 随桌面端更新。
+**更新。** `lynshen`（TUI）和 `lynshen serve` 启动时检查软件库。有新版本时，安装脚本或手动下载装的 release 构建会在后台下载并替换自己，下次启动生效；debug 构建只提示。版本清单有 Ed25519 签名，文件按 sha256 校验后才替换。手动更新用 `lynshen update`。在 `~/.lynshen/config.json` 里设 `"auto_update": false` 后只提示，不自动安装。npm 和 Homebrew 装的只提示，由 `lynshen update` 调用 npm 或 brew 更新；桌面端那份 CLI 随桌面端更新。
 
 ## 开始使用
 

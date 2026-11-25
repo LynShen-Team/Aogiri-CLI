@@ -45,6 +45,9 @@ jobs:
       - name: Test the skills mirror builder
         run: python3 deploy/skills-mirror/test_build.py
 
+      - name: Test the software library receiver
+        run: python3 deploy/software-library/test_receive.py
+
   # The relay (relay/, Go): vet and the race detector over its tests, v1 and
   # v2 (docs/relay-protocol.md).
   relay:

@@ -8,6 +8,12 @@ software.lynshen.org {
 	header @manifest Cache-Control "no-cache"
 	@versioned path_regexp versioned ^/[a-z0-9-]+/\d+\.\d+\.\d+/
 	header @versioned Cache-Control "public, max-age=31536000, immutable"
+	# The installers (`curl -fsSL .../cli/install.sh | bash`, `irm
+	# .../cli/install.ps1 | iex`) change with each release. Windows PowerShell
+	# reads text without a charset as Latin-1, so say UTF-8.
+	@installer path /cli/install.sh /cli/install.ps1
+	header @installer Cache-Control "no-cache"
+	header @installer Content-Type "text/plain; charset=utf-8"
 
 	header {
 		X-Content-Type-Options nosniff

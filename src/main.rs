@@ -536,8 +536,9 @@ fn queue_headless_denial(event: &AgentEvent, pending_denials: &mut Vec<(String, 
     }
 }
 
-/// `lynshen update`: npm installs update through npm, the copy LynShen Desktop
-/// manages updates with the app, and a release binary replaces itself.
+/// `lynshen update`: npm and Homebrew installs update through npm and brew,
+/// the copy LynShen Desktop manages updates with the app, and a release binary
+/// replaces itself.
 fn run_update() -> i32 {
     use lynshen_agent_core::update;
     let current = env!("CARGO_PKG_VERSION");
@@ -562,6 +563,7 @@ fn run_update() -> i32 {
     }
     let result = match (channel, &release) {
         (update::InstallChannel::Npm, _) => update::run_npm_update(),
+        (update::InstallChannel::Homebrew, _) => update::run_brew_upgrade(),
         (_, Some(release)) => update::self_update(release),
         (_, None) => Err("cannot update without the release information".to_string()),
     };
