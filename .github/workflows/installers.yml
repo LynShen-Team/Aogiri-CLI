@@ -68,7 +68,7 @@ jobs:
           "LYNSHEN_TEST_VERSION=$version" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Test install.ps1
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         run: |
-          & .\packaging\installer\test.ps1 -Binary "$env:RUNNER_TEMP\lynshen.exe" -Version $env:LYNSHEN_TEST_VERSION
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File .\packaging\installer\test.ps1 -Binary "$env:RUNNER_TEMP\lynshen.exe" -Version $env:LYNSHEN_TEST_VERSION
+          exit $LASTEXITCODE
