@@ -1,9 +1,9 @@
 use super::*;
-use crate::markdown::{render_markdown, MD_CODE, MD_DIM};
-use crate::tool_preview::{format_tool_header, tool_output_preview};
+use crate::markdown::{md_code, render_markdown};
+use crate::tool_preview::{tool_view, ToolState};
 use lynshen_agent_core::{ModelOptionView, SessionListItemView, TreeNodeView};
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use unicode_width::UnicodeWidthStr;
 
 fn markdown_text(lines: &[Line<'static>]) -> Vec<String> {
@@ -199,7 +199,7 @@ fn paste_burst_large_text_uses_placeholder() {
 
     assert_eq!(
         app.input.display_text(),
-        format!("[Pasted: {} chars]", PASTE_PLACEHOLDER_CHARS + 1)
+        format!("[已粘贴 {} 字]", PASTE_PLACEHOLDER_CHARS + 1)
     );
     assert_eq!(app.input.text(), pasted);
 }
@@ -284,32 +284,40 @@ fn up_on_an_empty_input_takes_back_the_last_queued_message() {
 #[test]
 fn input_renders_multiple_lines() {
     let document = UiBuilder::new()
-        .input(&input_lines("one\ntwo"), &[], 0)
+        .input(&input_lines("one\ntwo"), None)
         .finish();
 
+    assert_eq!(document.controls.len(), 2);
     assert_eq!(document.controls[0].kind, UiKind::Input);
-    assert_eq!(document.controls[0].plain(), "");
+    assert_eq!(document.controls[0].plain(), "  › one");
     assert_eq!(document.controls[1].kind, UiKind::Input);
-    assert_eq!(document.controls[1].plain(), "› one");
-    assert_eq!(document.controls[2].kind, UiKind::Input);
-    assert_eq!(document.controls[2].plain(), "  two");
-    assert_eq!(document.controls[3].kind, UiKind::Input);
-    assert_eq!(document.controls[3].plain(), "");
+    assert_eq!(document.controls[1].plain(), "    two");
 }
 
 #[test]
-fn single_line_input_renders_text_on_middle_row() {
+fn single_line_input_renders_one_prompt_row() {
     let document = UiBuilder::new()
-        .input(&input_lines("hello"), &[], 0)
+        .input(&input_lines("hello"), Some("unused"))
         .finish();
 
-    assert_eq!(document.controls.len(), 3);
+    assert_eq!(document.controls.len(), 1);
     assert_eq!(document.controls[0].kind, UiKind::Input);
-    assert_eq!(document.controls[0].plain(), "");
-    assert_eq!(document.controls[1].kind, UiKind::Input);
-    assert_eq!(document.controls[1].plain(), "› hello");
-    assert_eq!(document.controls[2].kind, UiKind::Input);
-    assert_eq!(document.controls[2].plain(), "");
+    assert_eq!(document.controls[0].plain(), "  › hello");
+}
+
+#[test]
+fn empty_input_shows_the_placeholder_after_the_caret() {
+    let document = UiBuilder::new()
+        .input(&input_lines(""), Some("描述任务"))
+        .finish();
+
+    assert_eq!(document.controls[0].plain(), "  › 描述任务");
+    assert_eq!(document.controls[0].cursor, Some(4));
+    assert!(document.controls[0]
+        .line
+        .spans
+        .iter()
+        .any(|span| span.content == "描述任务" && span.style == crate::theme::faint()));
 }
 
 #[test]
@@ -337,42 +345,73 @@ fn cursor_row_is_relative_to_whole_frame() {
 }
 
 #[test]
-fn command_completion_renders_below_input_with_selected_color() {
+fn command_palette_renders_below_input_with_descriptions() {
     let document = UiBuilder::new()
-        .input(
-            &input_lines("/"),
+        .input(&input_lines("/"), None)
+        .candidates(
             &[
                 CommandCandidate {
                     command: "/help".to_string(),
-                    marker: None,
+                    highlight: vec![0],
+                    ..CommandCandidate::default()
                 },
                 CommandCandidate {
                     command: "/review".to_string(),
                     marker: Some("SKILL".to_string()),
+                    description: "Review the diff".to_string(),
+                    highlight: vec![0],
                 },
             ],
             1,
+            80,
         )
         .finish();
 
-    assert_eq!(document.controls.len(), 5);
-    assert_eq!(document.controls[0].kind, UiKind::Input);
-    assert_eq!(document.controls[0].plain(), "");
-    assert_eq!(document.controls[1].kind, UiKind::Input);
-    assert_eq!(document.controls[1].plain(), "› /");
-    assert_eq!(document.controls[1].cursor, Some(3));
-    assert_eq!(document.controls[2].kind, UiKind::Input);
-    assert_eq!(document.controls[2].plain(), "");
-    assert_eq!(document.controls[3].kind, UiKind::Status);
-    assert_eq!(document.controls[3].plain(), "  /help");
-    assert_eq!(document.controls[4].kind, UiKind::Selected);
-    assert_eq!(document.controls[4].plain(), "  /review SKILL");
+    assert_eq!(document.controls[0].plain(), "  › /");
+    assert_eq!(document.controls[0].cursor, Some(5));
+    assert_eq!(document.controls[1].kind, UiKind::Candidate);
+    assert!(document.controls[1].plain().starts_with("    /help"));
+    assert!(document.controls[1].plain().contains("查看所有命令"));
+    assert_eq!(document.controls[2].kind, UiKind::CandidateSelected);
+    let selected = document.controls[2].plain();
+    assert!(selected.starts_with("  › /review"), "{selected}");
+    // Skills keep the engine's description and carry their tag.
+    assert!(selected.contains("Review the diff"), "{selected}");
+    assert!(selected.ends_with("技能"), "{selected}");
+    // The keys follow the rows.
+    assert!(document
+        .controls
+        .last()
+        .unwrap()
+        .plain()
+        .contains("tab 补全"));
 }
 
 #[test]
-fn model_and_tokens_render_below_input_without_ready_status() {
+fn slash_query_matches_commands_fuzzily_and_highlights() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.commands = ["/tree", "/resume", "/approve", "/rewind", "/permissions"]
+        .iter()
+        .map(|command| CommandCandidate {
+            command: command.to_string(),
+            ..CommandCandidate::default()
+        })
+        .collect();
+    app.input.push_text("/re");
+    let rows = app.state.completion_rows(&app.input);
+    let names: Vec<&str> = rows.iter().map(|row| row.command.as_str()).collect();
+    assert_eq!(names, vec!["/resume", "/rewind", "/tree", "/approve"]);
+    assert_eq!(rows[0].highlight, vec![0, 1, 2]);
+
+    // Enter completes the top match.
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), Instant::now());
+    assert_eq!(app.input.text(), "/resume ");
+}
+
+#[test]
+fn model_and_context_render_below_input_without_ready_status() {
     let document = UiBuilder::new()
-        .input(&input_lines("hello"), &[], 0)
+        .input(&input_lines("hello"), None)
         .bottom_status(
             BottomStatus {
                 provider: "openai",
@@ -383,24 +422,25 @@ fn model_and_tokens_render_below_input_without_ready_status() {
                 context_tokens: 12_345,
                 context_window: 400_000,
                 cost: 0.0,
+                balance: Some("¥128.40"),
             },
             80,
         )
         .finish();
 
-    assert_eq!(document.controls.len(), 4);
-    assert_eq!(document.controls[1].plain(), "› hello");
-    assert_eq!(document.controls[1].cursor, Some(7));
-    let status = document.controls[3].plain();
-    assert!(status.starts_with("openai / gpt-5 (medium) | auto-edit"));
-    assert!(status.ends_with("tokens 12345/400000 | context 3.1%"));
+    assert_eq!(document.controls.len(), 2);
+    assert_eq!(document.controls[0].plain(), "  › hello");
+    assert_eq!(document.controls[0].cursor, Some(9));
+    let status = document.controls[1].plain();
+    assert!(status.starts_with("  gpt-5 中   自动改文件"), "{status}");
+    assert!(status.ends_with("上下文 3% · ¥128.40  "), "{status}");
     assert!(!status.contains("ready"));
-    assert_eq!(document.controls[3].line.width(), 80);
+    assert_eq!(document.controls[1].line.width(), 80);
 }
 
 #[test]
 fn input_line_pads_to_frame_width() {
-    let document = UiBuilder::new().input(&input_lines("hi"), &[], 0).finish();
+    let document = UiBuilder::new().input(&input_lines("hi"), None).finish();
 
     let frame = RenderedFrame::build(&document, 40);
     let input_line = frame
@@ -414,18 +454,16 @@ fn input_line_pads_to_frame_width() {
 }
 
 #[test]
-fn native_cursor_tracks_middle_input_row() {
-    let document = UiBuilder::new()
-        .input(&input_lines("hello"), &[], 0)
-        .finish();
+fn native_cursor_tracks_the_prompt_row() {
+    let document = UiBuilder::new().input(&input_lines("hello"), None).finish();
 
     let frame = RenderedFrame::build(&document, 40);
     let cursor = frame.cursor.expect("cursor marker should be found");
 
-    assert_eq!(frame.lines.len(), 3);
-    assert!(frame.lines[cursor.row].starts_with("› hello"));
-    assert_eq!(cursor.row, 1);
-    assert_eq!(cursor.column, 2 + "hello".len());
+    assert_eq!(frame.lines.len(), 1);
+    assert!(frame.lines[cursor.row].starts_with("  › hello"));
+    assert_eq!(cursor.row, 0);
+    assert_eq!(cursor.column, 4 + "hello".len());
 }
 
 #[test]
@@ -437,7 +475,7 @@ fn progress_renders_above_input() {
     let progress_index = document
         .controls
         .iter()
-        .position(|line| line.plain().contains("connecting"))
+        .position(|line| line.plain().contains("连接中"))
         .expect("progress line should render");
     let input_index = document
         .controls
@@ -468,13 +506,13 @@ fn sent_message_is_dim_until_the_request_connects() {
         AgentEvent::UserMessage("hello".to_string()),
         AgentEvent::Connecting,
     ]);
-    assert_eq!(user_line_color(&mut app, "hello"), Some(Color::DarkGray));
+    assert_eq!(user_line_color(&mut app, "hello"), crate::theme::dim().fg);
     // The dim message stands in for the connecting indicator.
     let document = app.build_document(80, Instant::now());
     assert!(!document
         .controls
         .iter()
-        .any(|line| line.plain().contains("connecting")));
+        .any(|line| line.plain().contains("连接中")));
 
     app.apply_events(vec![AgentEvent::ThinkingStart]);
     assert_eq!(user_line_color(&mut app, "hello"), None);
@@ -494,7 +532,7 @@ fn a_failed_request_still_shows_the_sent_message_normally() {
 #[test]
 fn colored_status_line_does_not_wrap_at_visible_width() {
     let document = UiBuilder::new()
-        .input(&input_lines(""), &[], 0)
+        .input(&input_lines(""), None)
         .bottom_status(
             BottomStatus {
                 provider: "lynshen",
@@ -505,6 +543,7 @@ fn colored_status_line_does_not_wrap_at_visible_width() {
                 context_tokens: 1633,
                 context_window: 400_000,
                 cost: 0.0,
+                balance: None,
             },
             64,
         )
@@ -512,99 +551,202 @@ fn colored_status_line_does_not_wrap_at_visible_width() {
 
     let frame = RenderedFrame::build(&document, 64);
 
-    assert_eq!(frame.lines.len(), 4);
-    assert!(frame.lines[3].contains("tokens 1633/400000 | context 0.4%"));
-    assert_eq!(UnicodeWidthStr::width(frame.lines[3].as_str()), 64);
+    assert_eq!(frame.lines.len(), 2);
+    assert!(frame.lines[1].contains("上下文 0%"), "{:?}", frame.lines[1]);
+    assert_eq!(UnicodeWidthStr::width(frame.lines[1].as_str()), 64);
 }
 
 #[test]
-fn startup_renders_inside_box() {
-    let document = UiBuilder::new()
-        .chat(&[ChatLine::Startup {
-            version: "0.1.2".to_string(),
-            profile_dir: "C:\\Users\\me\\.lynshen".to_string(),
-            config_path: "E:\\Code\\Projects\\LynShen\\LynShen-CLI".to_string(),
-            cwd: "C:\\Users\\me\\projects\\lynshen".to_string(),
-            model: "claude-opus-4-7".to_string(),
-            context_window: 1_000_000,
-        }])
-        .finish();
+fn narrow_status_line_drops_segments_in_steps() {
+    let dirty = crate::git_bar::GitStatus {
+        branch: "feat/tui".to_string(),
+        dirty: true,
+    };
+    let status = |width| {
+        UiBuilder::new()
+            .bottom_status(
+                BottomStatus {
+                    provider: "lynshen",
+                    model: "claude-opus-4.7",
+                    reasoning_effort: "high",
+                    approval_mode: "manual",
+                    git: Some(&dirty),
+                    context_tokens: 1633,
+                    context_window: 400_000,
+                    cost: 0.0,
+                    balance: Some("¥128.40"),
+                },
+                width,
+            )
+            .finish()
+            .controls
+            .last()
+            .unwrap()
+            .plain()
+    };
+    let wide = status(100);
+    assert!(
+        wide.contains("feat/tui*") && wide.contains("手动批准"),
+        "{wide}"
+    );
+    let narrow = status(44);
+    assert!(!narrow.contains("feat/tui"), "{narrow}");
+    assert!(narrow.contains("¥128.40"), "{narrow}");
+    assert!(UnicodeWidthStr::width(narrow.as_str()) <= 44);
+}
 
-    assert_eq!(document.history[0].plain().chars().next(), Some('╭'));
-    // Box borders keep their muted accent color as a span style.
-    assert!(document.history[0]
+#[test]
+fn startup_shows_the_mark_beside_the_session_lines() {
+    let document = UiBuilder::new()
+        .chat_with_width(
+            &[ChatLine::Startup {
+                version: "0.1.2".to_string(),
+                cwd: "/srv/projects/lynshen".to_string(),
+                model: "claude-opus-4-7".to_string(),
+                context_window: 1_000_000,
+            }],
+            80,
+        )
+        .finish();
+    let rows: Vec<String> = document.history.iter().map(UiLine::plain).collect();
+
+    assert!(rows[0].starts_with("  ▄  ▐▌    LynShen  0.1.2"), "{rows:?}");
+    assert!(
+        rows[1].starts_with("▗▖▝▙ ▐▌    claude-opus-4-7 · 1M 上下文"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[2].starts_with("▐▌ ▝▘▐▌    /srv/projects/lynshen"),
+        "{rows:?}"
+    );
+    assert_eq!(rows[3].trim_end(), "▐▌   ▐▌");
+    // The light is in the accent; the trunks keep the text colour.
+    let light = document.history[0]
         .line
         .spans
         .iter()
-        .any(|span| span.style.fg == Some(Color::Rgb(108, 96, 140))));
-    assert!(document.history[1].plain().contains(" \\/"));
-    assert!(document.history[1].plain().contains("Welcome to LynShen"));
-    assert!(document.history[2].plain().contains("<'l"));
-    assert!(document.history[2]
-        .plain()
-        .contains("v0.1.2 · claude-opus-4-7 · 1M context"));
-    assert!(document.history[3].plain().contains(" ll"));
-    assert!(document.history[4].plain().contains(" llama~"));
-    assert!(document.history[4].plain().contains("cwd:"));
-    // The brand word and key info are bold.
-    let title = &document.history[1].line;
-    assert!(title.spans.iter().any(|span| {
-        span.content.as_ref() == "LynShen" && span.style.add_modifier.contains(Modifier::BOLD)
-    }));
-    assert!(!document
-        .history
+        .find(|span| span.content == "▄")
+        .unwrap();
+    assert_eq!(light.style, crate::theme::accent());
+    let name = document.history[0]
+        .line
+        .spans
         .iter()
-        .any(|line| line.plain().contains("directory:")));
-    assert!(document.history[6].plain().contains(" '' ''"));
-    assert!(document.history[6].plain().contains("/help for commands"));
-    assert_eq!(document.history[7].plain().chars().next(), Some('╰'));
-    let border_width = document.history[0].line.width();
-    for line in document.history.iter().take(8) {
-        assert_eq!(line.line.width(), border_width, "{}", line.plain());
-    }
+        .find(|span| span.content == "LynShen")
+        .unwrap();
+    assert!(name.style.add_modifier.contains(Modifier::BOLD));
+    assert!(
+        rows[5].contains("/ 命令") && rows[5].contains("? 快捷键"),
+        "{rows:?}"
+    );
+    assert!(!rows.iter().any(|row| row.contains("llama")));
 }
 
 #[test]
-fn projected_startup_box_lines_stay_aligned() {
+fn startup_drops_the_mark_on_narrow_terminals() {
     let document = UiBuilder::new()
-        .chat(&[ChatLine::Startup {
-            version: "0.1.2".to_string(),
-            profile_dir: "~/.lynshen".to_string(),
-            config_path: "~/.lynshen/config.toml".to_string(),
-            cwd: "~/dev/projects/lynshen/LynShen-CLI".to_string(),
-            model: "gpt-5.4".to_string(),
-            context_window: 1_100_000,
-        }])
+        .chat_with_width(
+            &[ChatLine::Startup {
+                version: "0.1.2".to_string(),
+                cwd: "/srv/x".to_string(),
+                model: "gpt-5.5".to_string(),
+                context_window: 400_000,
+            }],
+            40,
+        )
+        .finish();
+    let rows: Vec<String> = document.history.iter().map(UiLine::plain).collect();
+    assert_eq!(rows[0], "LynShen  0.1.2");
+    assert!(rows.iter().all(|row| !row.contains('▐')));
+}
+
+#[test]
+fn startup_names_the_account_and_plan() {
+    let welcome = crate::ui_builder::WelcomeInfo {
+        provider: "lynshen".to_string(),
+        model: "gpt-5.5".to_string(),
+        effort: "high".to_string(),
+        has_efforts: true,
+        context_window: 400_000,
+        account: AccountState::Ready(lynshen_agent_core::AccountSummary {
+            email: "dev@example.com".to_string(),
+            balance: Some("128.4".to_string()),
+            currency: Some("CNY".to_string()),
+            plan: Some("Pro".to_string()),
+        }),
+    };
+    let document = UiBuilder::new()
+        .welcome(welcome)
+        .chat_with_width(
+            &[ChatLine::Startup {
+                version: "0.1.2".to_string(),
+                cwd: "/srv/x".to_string(),
+                model: "gpt-5.5".to_string(),
+                context_window: 400_000,
+            }],
+            80,
+        )
+        .finish();
+    let rows: Vec<String> = document.history.iter().map(UiLine::plain).collect();
+    assert!(rows[1].ends_with("dev@example.com · Pro"), "{rows:?}");
+    assert!(
+        rows[2].contains("gpt-5.5 · 思考 高 · 400K 上下文"),
+        "{rows:?}"
+    );
+    assert_eq!(
+        AccountState::Ready(lynshen_agent_core::AccountSummary {
+            email: String::new(),
+            balance: Some("128.4".to_string()),
+            currency: Some("CNY".to_string()),
+            plan: None,
+        })
+        .balance()
+        .as_deref(),
+        Some("¥128.40")
+    );
+}
+
+#[test]
+fn startup_text_column_lines_up_when_projected() {
+    let document = UiBuilder::new()
+        .chat_with_width(
+            &[ChatLine::Startup {
+                version: "0.1.2".to_string(),
+                cwd: "~/dev/projects/lynshen/LynShen-CLI".to_string(),
+                model: "gpt-5.4".to_string(),
+                context_window: 1_100_000,
+            }],
+            78,
+        )
         .finish();
 
     let frame = RenderedFrame::build(&document, 80);
-    let plain = frame.lines.clone();
-    let width = UnicodeWidthStr::width(plain[0].as_str());
-
-    for line in plain.iter().take(8) {
-        assert!(
-            line.starts_with(['╭', '│', '╰']),
-            "startup box line should not be indented: {line:?}"
-        );
-        assert_eq!(UnicodeWidthStr::width(line.as_str()), width);
-    }
+    let column = |line: &str, needle: &str| {
+        let at = line.find(needle).expect(needle);
+        UnicodeWidthStr::width(&line[..at])
+    };
+    assert_eq!(column(&frame.lines[0], "LynShen"), 13);
+    assert_eq!(column(&frame.lines[1], "gpt-5.4"), 13);
+    assert_eq!(column(&frame.lines[2], "~/dev"), 13);
 }
 
 #[test]
-fn connecting_progress_uses_continuous_color_gradient() {
+fn progress_shows_phase_elapsed_and_tokens() {
     let now = Instant::now();
     let mut activity = ActivityState::idle();
     activity.kind = ActivityKind::Connecting;
-    activity.turn_started_at = Some(now - Duration::from_secs(11));
-    activity.phase_started_at = Some(now - Duration::from_secs(11));
+    activity.turn_started_at = Some(now - Duration::from_secs(75));
+    activity.phase_started_at = Some(now - Duration::from_secs(2));
 
-    assert_eq!(activity.progress(now, 0).unwrap().color, (255, 60, 60));
+    let progress = activity.progress(now, 0).unwrap();
+    assert_eq!(progress.phase, "连接中");
+    assert_eq!(progress.detail, "1 分 15 秒");
+    assert!(!progress.stalled);
 
-    activity.phase_started_at = Some(now - Duration::from_secs(5));
-    assert_eq!(activity.progress(now, 0).unwrap().color, (255, 210, 0));
-
-    activity.phase_started_at = Some(now - Duration::from_secs(1));
-    assert_eq!(activity.progress(now, 0).unwrap().color, (255, 246, 204));
+    activity.kind = ActivityKind::Thinking;
+    let progress = activity.progress(now, 2_400).unwrap();
+    assert_eq!(progress.phase, "思考中");
+    assert_eq!(progress.detail, "1 分 15 秒 · ↓ 2k tokens");
 }
 
 #[test]
@@ -673,7 +815,7 @@ fn thinking_header_click_toggles_reasoning_block() {
             ..
         })
     ));
-    app.state.toggle_reasoning_collapsed(index);
+    app.state.toggle_item(index);
     assert!(matches!(
         app.state.chat.get(index),
         Some(ChatLine::Reasoning {
@@ -681,7 +823,7 @@ fn thinking_header_click_toggles_reasoning_block() {
             ..
         })
     ));
-    app.state.toggle_reasoning_collapsed(index);
+    app.state.toggle_item(index);
     assert!(matches!(
         app.state.chat.get(index),
         Some(ChatLine::Reasoning {
@@ -710,7 +852,7 @@ fn reasoning_tokens_show_in_thinking_progress_not_transcript() {
     assert!(document
         .controls
         .iter()
-        .any(|line| line.plain().contains("thinking") && line.plain().contains("(88 tokens)")));
+        .any(|line| line.plain().contains("思考中") && line.plain().contains("↓ 88 tokens")));
     assert!(!document
         .history
         .iter()
@@ -745,15 +887,14 @@ fn markdown_bold_and_italic_render_inline() {
 #[test]
 fn markdown_inline_code_recolors_and_restores_base() {
     let lines = render_markdown("run `a*b*c` now", usize::MAX);
-    // Inline code is a chip (fg + subtle bg) as a single styled span.
+    // Inline code is one span in the code tone.
     assert_eq!(markdown_text(&lines), vec!["run a*b*c now"]);
     let chip = lines[0]
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "a*b*c")
         .expect("code span");
-    assert_eq!(chip.style.bg, MD_CODE.bg);
-    assert_eq!(chip.style.fg, MD_CODE.fg);
+    assert_eq!(chip.style.fg, md_code().fg);
 }
 
 #[test]
@@ -764,8 +905,10 @@ fn markdown_fenced_code_block_renders_verbatim_with_gutter() {
         markdown_text(&lines),
         vec!["before", "│ let x = **2**;", "│ foo();", "after"]
     );
-    // Code lines are dim; emphasis markers inside them stay literal.
-    assert!(lines[1].spans.iter().all(|span| span.style.fg == MD_DIM.fg));
+    // A faint rule on the left; the code keeps the text colour and its
+    // emphasis markers stay literal.
+    assert_eq!(lines[1].spans[0].style, crate::theme::faint());
+    assert_eq!(lines[1].spans[1].style.fg, None);
 }
 
 #[test]
@@ -862,7 +1005,7 @@ fn collapsed_reasoning_message_keeps_only_duration_header() {
         .filter(|line| !line.is_blank())
         .collect();
     assert_eq!(visible.len(), 1);
-    assert!(visible[0].plain().contains("✻ thought for 2s"));
+    assert!(visible[0].plain().contains("∴ 思考了 2 秒"));
     // The header is the click target that expands the block again.
     assert_eq!(visible[0].click, Some(0));
 }
@@ -882,7 +1025,7 @@ fn expanded_reasoning_message_renders_body_lines() {
         .filter(|line| !line.is_blank())
         .map(|line| line.plain().trim().to_string())
         .collect();
-    assert_eq!(visible, vec!["✻ thought for 1m 30s", "l1", "l2"]);
+    assert_eq!(visible, vec!["∴ 思考了 1 分 30 秒", "l1", "l2"]);
 }
 
 #[test]
@@ -902,7 +1045,7 @@ fn compaction_events_set_progress_notices_and_context_meter() {
         .state
         .chat
         .iter()
-        .any(|line| matches!(line, ChatLine::System(text) if text.contains("Compacting"))));
+        .any(|line| matches!(line, ChatLine::System(text) if text.contains("正在压缩"))));
 
     app.apply_events(vec![AgentEvent::CompactionProgress { output_tokens: 42 }]);
     assert_eq!(app.state.activity.estimated_output_tokens, 42);
@@ -922,77 +1065,147 @@ fn compaction_events_set_progress_notices_and_context_meter() {
         .state
         .chat
         .iter()
-        .any(|line| matches!(line, ChatLine::System(text) if text.contains("compacted"))));
+        .any(|line| matches!(line, ChatLine::System(text) if text.contains("已压缩"))));
     assert_eq!(app.state.current_context_tokens, 25_000);
 }
 
 #[test]
-fn output_progress_color_warms_as_stream_stalls() {
+fn output_progress_reports_a_stall() {
     let now = Instant::now();
     let mut activity = ActivityState::idle();
     activity.kind = ActivityKind::Output;
-    activity.turn_started_at = Some(now - Duration::from_secs(6));
-    activity.phase_started_at = Some(now - Duration::from_secs(6));
+    activity.turn_started_at = Some(now - Duration::from_secs(20));
+    activity.phase_started_at = Some(now - Duration::from_secs(20));
     activity.estimated_output_tokens = 12;
 
     activity.last_delta_at = Some(now);
-    let fresh = activity.progress(now, 0).unwrap().color;
-    activity.last_delta_at = Some(now - Duration::from_secs(3));
-    let stalled = activity.progress(now, 0).unwrap().color;
+    let fresh = activity.progress(now, 0).unwrap();
+    assert_eq!(fresh.phase, "输出中");
+    assert!(!fresh.stalled);
 
-    assert_eq!(fresh, (70, 220, 110));
-    assert!(stalled.0 > fresh.0);
-    assert!(stalled.2 < fresh.2);
+    activity.last_delta_at = Some(now - Duration::from_secs(9));
+    let stalled = activity.progress(now, 0).unwrap();
+    assert_eq!(stalled.phase, "等待响应 9 秒");
+    assert!(stalled.stalled);
 }
 
 #[test]
-fn spinner_presets_are_single_ascii_chars() {
-    let presets = [
-        SpinnerPreset::Line,
-        SpinnerPreset::Dots,
-        SpinnerPreset::Pulse,
-        SpinnerPreset::Scan,
-    ];
-
-    for preset in presets {
-        let value = spinner_char(preset, 1, 1);
-        assert_eq!(value.len(), 1);
-        assert!(value.is_ascii());
+fn spinner_frames_are_single_cells() {
+    for tick in 0..24 {
+        assert_eq!(UnicodeWidthStr::width(spinner_char(tick)), 1);
     }
+    crate::theme::with_theme(
+        crate::theme::Theme {
+            rich_glyphs: false,
+            ..crate::theme::Theme::new(crate::theme::ColorDepth::Ansi16, None)
+        },
+        || {
+            for tick in 0..8 {
+                assert!(spinner_char(tick).is_ascii());
+            }
+        },
+    );
 }
 
 #[test]
-fn tool_output_preview_truncates_long_output() {
+fn long_generic_output_folds_until_expanded() {
     let output = (0..20)
         .map(|index| format!("line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let preview = preview_text(&tool_output_preview("custom", &output, false));
+    let tool = ChatLine::Tool {
+        call_id: None,
+        name: "custom".to_string(),
+        output,
+        running: false,
+        expanded: false,
+    };
+    let folded = preview_text(
+        &UiBuilder::new()
+            .chat(std::slice::from_ref(&tool))
+            .into_history(),
+    );
+    assert!(folded.contains("custom  line 0"), "{folded}");
+    assert!(folded.contains("line 6"));
+    assert!(!folded.contains("line 19"));
+    assert!(folded.contains("⋯ 还有 13 行 · ctrl+o 展开"), "{folded}");
 
-    assert!(preview.contains("line 0"));
-    assert!(!preview.contains("line 19"));
-    assert!(preview.contains('…'));
+    let open = preview_text(
+        &UiBuilder::new()
+            .expand_tools(true)
+            .chat(&[tool])
+            .into_history(),
+    );
+    assert!(open.contains("line 19"));
+    assert!(!open.contains("ctrl+o"));
 }
 
 #[test]
-fn tool_output_preview_prefers_diff_field() {
+fn shell_output_keeps_its_tail_when_folded() {
+    let stdout = (0..10)
+        .map(|index| format!("step {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output =
+        serde_json::json!({"command": "make", "exit_code": 2, "stdout": stdout}).to_string();
+    let history = UiBuilder::new()
+        .chat(&[ChatLine::Tool {
+            call_id: None,
+            name: "bash".to_string(),
+            output,
+            running: false,
+            expanded: false,
+        }])
+        .into_history();
+    let text = preview_text(&history);
+    assert!(text.starts_with("● 运行  make  退出码 2"), "{text}");
+    assert!(text.contains("│ ⋯ 前 6 行已折叠 · ctrl+o 展开"), "{text}");
+    assert!(text.contains("└ step 9"), "{text}");
+    assert!(!text.contains("step 5"));
+    // A failed call's dot is in the error colour, and the header is the
+    // click target.
+    assert_eq!(history[0].line.spans[0].style, crate::theme::err());
+    assert_eq!(history[0].click, Some(0));
+}
+
+#[test]
+fn ctrl_o_expands_every_tool_block() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![AgentEvent::ToolOutput {
+        call_id: "c1".to_string(),
+        name: "custom".to_string(),
+        output: (0..30).map(|i| format!("row {i}\n")).collect(),
+        is_error: false,
+    }]);
+    let history =
+        |app: &mut TuiApp<TestRuntime>| preview_text(&app.state.rendered_history_lines(80));
+    assert!(!history(&mut app).contains("row 29"));
+    app.handle_key_at(KeyCode::Char('o'), KeyModifiers::CONTROL, Instant::now());
+    assert!(history(&mut app).contains("row 29"));
+    app.handle_key_at(KeyCode::Char('o'), KeyModifiers::CONTROL, Instant::now());
+    assert!(!history(&mut app).contains("row 29"));
+}
+
+#[test]
+fn tool_view_prefers_diff_field() {
     let output = serde_json::json!({
         "stdout": "raw",
         "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n"
     })
     .to_string();
 
-    let visible_preview = preview_text(&tool_output_preview("str_replace", &output, false));
+    let view = tool_view("str_replace", &output, false);
+    let body = preview_text(&view.body);
 
-    assert!(visible_preview.contains("a (+1 -1)"));
-    assert!(visible_preview.contains("1 -  old"));
-    assert!(visible_preview.contains("1 +  new"));
-    assert!(!visible_preview.contains("diff --git a/a b/a"));
-    assert!(!visible_preview.contains("raw"));
+    assert_eq!(view.arg, "a");
+    assert!(body.contains("    1 - old"), "{body}");
+    assert!(body.contains("    1 + new"), "{body}");
+    assert!(!body.contains("diff --git a/a b/a"));
+    assert!(!body.contains("raw"));
 }
 
 #[test]
-fn tool_output_preview_appends_rejected_hunk_count_after_partial_approval() {
+fn tool_view_appends_rejected_hunk_count_after_partial_approval() {
     let output = serde_json::json!({
         "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
         "applied_hunks": ["f0h2"],
@@ -1000,11 +1213,11 @@ fn tool_output_preview_appends_rejected_hunk_count_after_partial_approval() {
     })
     .to_string();
 
-    let visible_preview = preview_text(&tool_output_preview("str_replace", &output, false));
+    let body = preview_text(&tool_view("str_replace", &output, false).body);
 
     // The diff shows only the applied hunks, plus a rejected-count line.
-    assert!(visible_preview.contains("1 +  new"));
-    assert!(visible_preview.contains("2 hunk(s) rejected by user (not applied)"));
+    assert!(body.contains("    1 + new"));
+    assert!(body.contains("你拒绝了 2 处改动（没有应用）"));
 
     // A whole-call approval (nothing rejected) adds no such line.
     let full = serde_json::json!({
@@ -1013,11 +1226,11 @@ fn tool_output_preview_appends_rejected_hunk_count_after_partial_approval() {
         "rejected_hunks": [],
     })
     .to_string();
-    assert!(!preview_text(&tool_output_preview("str_replace", &full, false)).contains("rejected"));
+    assert!(!preview_text(&tool_view("str_replace", &full, false).body).contains("拒绝"));
 }
 
 #[test]
-fn tool_output_preview_keeps_additions_after_large_removals() {
+fn large_diff_counts_both_sides_and_shows_all_when_expanded() {
     let removals = (0..30)
         .map(|index| format!("-old line {index}"))
         .collect::<Vec<_>>()
@@ -1025,26 +1238,36 @@ fn tool_output_preview_keeps_additions_after_large_removals() {
     let diff = format!(
             "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,30 +1,2 @@\n{removals}\n+new important line\n+another important line\n"
         );
-    let output = serde_json::json!({
-        "stdout": "raw",
-        "diff": diff
-    })
-    .to_string();
+    let output = serde_json::json!({ "stdout": "raw", "diff": diff }).to_string();
 
-    let preview = preview_text(&tool_output_preview("edit", &output, false));
+    let view = tool_view("edit", &output, false);
+    let extra: String = view
+        .extra
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert_eq!(view.arg, "README.md");
+    assert_eq!(extra, "+2 −30");
+    let body = preview_text(&view.body);
+    assert!(body.contains("    1 - old line 0"));
+    assert!(body.contains("   30 - old line 29"));
+    assert!(body.contains("    1 + new important line"));
+    assert!(body.contains("    2 + another important line"));
+    assert!(!body.contains("--- a/README.md"));
 
-    assert!(preview.contains("README.md (+2 -30)"));
-    assert!(preview.contains("     1 -  old line 0"));
-    assert!(preview.contains("    30 -  old line 29"));
-    assert!(preview.contains("     1 +  new important line"));
-    assert!(preview.contains("     2 +  another important line"));
-    assert!(!preview.contains("--- a/README.md"));
-    assert!(!preview.contains("+++ b/README.md"));
-    assert!(!preview.contains('…'));
+    let tool = ChatLine::Tool {
+        call_id: None,
+        name: "edit".to_string(),
+        output,
+        running: false,
+        expanded: true,
+    };
+    let open = preview_text(&UiBuilder::new().chat(&[tool]).into_history());
+    assert!(open.contains("another important line"));
 }
 
 #[test]
-fn tool_output_preview_projects_read_and_ls() {
+fn tool_view_projects_read_and_ls() {
     let read = serde_json::json!({
         "path": "C:\\repo\\src\\main.rs",
         "offset": 5,
@@ -1052,73 +1275,62 @@ fn tool_output_preview_projects_read_and_ls() {
         "content": "hidden"
     })
     .to_string();
-    let ls = serde_json::json!({
-        "path": "C:\\repo\\src",
-        "entries": ["main.rs"]
-    })
-    .to_string();
+    let ls = serde_json::json!({ "path": "C:\\repo\\src", "entries": ["main.rs"] }).to_string();
 
-    let read_preview = preview_text(&tool_output_preview("read", &read, false));
-    let ls_preview = preview_text(&tool_output_preview("ls", &ls, false));
-
-    assert_eq!(read_preview, "read main.rs: 12 lines from line 5");
-    assert!(!read_preview.contains("hidden"));
-    assert_eq!(ls_preview, "ls C:\\repo\\src");
+    let read_view = tool_view("read", &read, false);
+    let extra: String = read_view
+        .extra
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert_eq!(read_view.verb, "读取");
+    assert_eq!(read_view.arg, "C:\\repo\\src\\main.rs");
+    assert_eq!(extra, "5–16 行");
+    assert!(read_view.body.is_empty());
+    let ls_view = tool_view("ls", &ls, false);
+    assert_eq!(ls_view.verb, "列出");
+    assert_eq!(ls_view.arg, "C:\\repo\\src");
 }
 
 #[test]
-fn generate_image_preview_lists_saved_paths() {
+fn generate_image_view_lists_saved_paths() {
     let output = serde_json::json!({
         "paths": ["images/fox.png", "images/fox-2.png"],
         "model": "gpt-image-2",
         "revised_prompt": "a fox"
     })
     .to_string();
-    let preview = tool_output_preview("generate_image", &output, false);
-    assert_eq!(
-        preview_text(&preview),
-        "saved images/fox.png\nsaved images/fox-2.png"
-    );
-    let header = format_tool_header(
-        "generate_image",
-        false,
-        preview.first().map(|l| &l.line),
-        60,
-    );
-    assert!(header
-        .spans
-        .iter()
-        .any(|span| span.content.as_ref() == "Generated"));
+    let view = tool_view("generate_image", &output, false);
+    assert_eq!(view.verb, "生成图片");
+    assert_eq!(view.arg, "images/fox.png");
+    assert_eq!(preview_text(&view.body), "images/fox-2.png");
 }
 
 #[test]
 fn tool_error_json_shows_message_not_raw_json() {
-    let preview = tool_output_preview(
+    let view = tool_view(
         "write_stdin",
         r#"{"error":"shell session not found","session_id":0}"#,
         false,
     );
-    assert_eq!(preview_text(&preview), "error: shell session not found");
+    let extra: String = view
+        .extra
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert_eq!(view.state, ToolState::Failed);
+    assert_eq!(extra, "shell session not found");
     // The header names the real tool instead of a generic "Tool".
-    let header = format_tool_header("write_stdin", false, preview.first().map(|l| &l.line), 60);
-    assert!(header
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect::<String>()
-        .contains("Sent"));
+    assert_eq!(view.verb, "输入");
     // MCP tools show server/tool rather than the mcp__ prefix form.
-    let header = format_tool_header("mcp__fs__read_file", false, None, 60);
-    assert!(header
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect::<String>()
-        .contains("fs/read_file"));
+    assert_eq!(
+        tool_view("mcp__fs__read_file", "", false).verb,
+        "fs/read_file"
+    );
 }
 
 #[test]
-fn running_session_preview_shows_session_not_exit_code() {
+fn running_session_shows_still_running_not_exit_code() {
     let output = serde_json::json!({
         "command": "cargo test",
         "session_id": 3,
@@ -1128,13 +1340,19 @@ fn running_session_preview_shows_session_not_exit_code() {
     })
     .to_string();
 
-    let preview = preview_text(&tool_output_preview("write_stdin", &output, false));
-    assert!(preview.contains("cargo test  session 3 running"));
-    assert!(!preview.contains("exit"));
+    let view = tool_view("write_stdin", &output, false);
+    let extra: String = view
+        .extra
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert_eq!(view.arg, "cargo test");
+    assert_eq!(extra, "后台运行中");
+    assert_ne!(view.state, ToolState::Failed);
 }
 
 #[test]
-fn tool_output_preview_projects_bash_latest_logs() {
+fn tool_view_projects_bash_latest_logs() {
     let output = serde_json::json!({
         "command": "cargo test",
         "exit_code": 0,
@@ -1144,11 +1362,10 @@ fn tool_output_preview_projects_bash_latest_logs() {
     })
     .to_string();
 
-    let plain_preview = preview_text(&tool_output_preview("bash", &output, false));
-
-    assert!(plain_preview.contains("cargo test  exit 0"));
-    assert!(plain_preview.contains("stdout:"));
-    assert!(plain_preview.contains("three"));
+    let view = tool_view("bash", &output, false);
+    assert_eq!(view.arg, "cargo test");
+    assert!(view.extra.is_empty());
+    assert_eq!(preview_text(&view.body), "one\ntwo\nthree");
 }
 
 #[test]
@@ -1173,7 +1390,7 @@ fn chat_history_separates_turns_with_blank_lines() {
 }
 
 #[test]
-fn tool_preview_colors_diff_lines() {
+fn tool_block_colors_diff_lines() {
     let document = UiBuilder::new()
         .chat(&[ChatLine::Tool {
             call_id: None,
@@ -1183,21 +1400,33 @@ fn tool_preview_colors_diff_lines() {
             })
             .to_string(),
             running: false,
+            expanded: false,
         }])
         .finish();
 
+    let removed = document
+        .history
+        .iter()
+        .find(|line| line.kind == UiKind::DiffRemove)
+        .expect("removed line");
+    assert!(removed.plain().contains("1 - old"));
     assert!(document
         .history
         .iter()
-        .any(|line| line.kind == UiKind::DiffRemove && line.plain().contains("1 -  old")));
-    assert!(document
-        .history
+        .any(|line| line.kind == UiKind::DiffAdd && line.plain().contains("1 + new")));
+    // The line number stays unfilled; the sign and text carry the fill.
+    let fill = crate::theme::surface(crate::theme::Surface::DelLine);
+    assert!(fill.is_some());
+    assert!(removed
+        .line
+        .spans
         .iter()
-        .any(|line| line.kind == UiKind::DiffAdd && line.plain().contains("1 +  new")));
+        .any(|span| span.content.contains("1 ") && span.style.bg.is_none()));
+    assert!(removed.line.spans.iter().any(|span| span.style.bg == fill));
 }
 
 #[test]
-fn projection_only_indents_text_not_ui_elements() {
+fn projection_indents_history_and_keeps_controls_flush() {
     let document = UiBuilder::new()
         .chat(&[
             ChatLine::Assistant("answer".to_string()),
@@ -1209,9 +1438,10 @@ fn projection_only_indents_text_not_ui_elements() {
                 })
                 .to_string(),
                 running: false,
+                expanded: false,
             },
         ])
-        .input(&input_lines("hello"), &[], 0)
+        .input(&input_lines("hello"), None)
         .bottom_status(
             BottomStatus {
                 provider: "lynshen",
@@ -1222,6 +1452,7 @@ fn projection_only_indents_text_not_ui_elements() {
                 context_tokens: 10,
                 context_window: 100,
                 cost: 0.0,
+                balance: None,
             },
             40,
         )
@@ -1232,15 +1463,15 @@ fn projection_only_indents_text_not_ui_elements() {
 
     assert!(plain.iter().any(|line| line.starts_with("  answer")));
     assert!(plain.iter().any(|line| line.is_empty()));
-    assert!(plain.iter().any(|line| line.starts_with("● Edit")));
-    assert!(plain.iter().any(|line| line.contains("⎿")));
-    assert!(plain.iter().any(|line| line.contains("1 -")));
-    assert!(plain.iter().any(|line| line.starts_with("› hello")));
-    let bottom_status = plain
-        .iter()
-        .find(|line| line.contains("tokens 10/100"))
-        .expect("bottom status should render");
-    assert!(!bottom_status.starts_with("  "));
+    assert!(
+        plain
+            .iter()
+            .any(|line| line.starts_with("  ● 编辑  a  +1 −1")),
+        "{plain:?}"
+    );
+    assert!(plain.iter().any(|line| line.contains("1 - old")));
+    assert!(plain.iter().any(|line| line.starts_with("  › hello")));
+    assert!(plain.iter().any(|line| line.contains("上下文 10%")));
 }
 
 #[test]
@@ -1252,7 +1483,7 @@ fn projection_keeps_full_history_for_in_app_scroll() {
 
     assert!(output.contains("line 0"));
     assert!(output.contains("line 19"));
-    assert_eq!(frame.lines.len(), 24);
+    assert_eq!(frame.lines.len(), 22);
 }
 
 #[test]
@@ -1332,9 +1563,9 @@ fn cursor_row_accounts_for_full_history() {
     let frame = RenderedFrame::build(&document, 80);
     let cursor = frame.cursor.expect("cursor marker should be found");
 
-    assert_eq!(frame.lines.len(), 24);
-    assert_eq!(cursor.row, 22);
-    assert_eq!(cursor.column, 2);
+    assert_eq!(frame.lines.len(), 22);
+    assert_eq!(cursor.row, 21);
+    assert_eq!(cursor.column, 4);
 }
 
 #[test]
@@ -1480,22 +1711,20 @@ fn fill_input_event_populates_input_box() {
 }
 
 #[test]
-fn checkout_tree_marks_rows_with_children_as_directories() {
-    // Wide tree: the root is expanded ([-]); a child with hidden descendants
-    // stays collapsed ([+]).
+fn checkout_tree_marks_rows_with_children_as_folds() {
+    // Wide tree: the root is expanded (▾); a child with hidden descendants
+    // stays collapsed (▸).
     let tree = PickerState::checkout(wide_tree_nodes());
     let document = UiBuilder::new().picker(Some(&tree), 80).finish();
 
     assert!(document
         .controls
         .iter()
-        .any(|line| line.plain().contains("[-]") && line.plain().contains("user: root")));
+        .any(|line| line.plain().contains("▾") && line.plain().contains("root")));
     assert!(document
         .controls
         .iter()
-        .any(|line| line.kind == UiKind::TreeDirectory
-            && line.plain().contains("[+]")
-            && line.plain().contains("user: child 2")));
+        .any(|line| line.plain().contains("▸") && line.plain().contains("child 2")));
 }
 
 #[test]
@@ -1525,16 +1754,14 @@ fn checkout_tree_marks_head_and_active_path() {
     let document = UiBuilder::new().picker(Some(&tree), 80).finish();
     let controls = &document.controls;
 
-    // The HEAD node is annotated as the current position.
-    assert!(controls
-        .iter()
-        .any(|line| line.plain().contains("user: third") && line.plain().contains("current")));
+    // The HEAD node is annotated as the current position, and selected.
+    assert!(controls.iter().any(|line| line.kind == UiKind::Selected
+        && line.plain().contains("third")
+        && line.plain().contains("当前")));
     // Every node on the path to the HEAD is bulleted (root e1 included).
     assert!(controls
         .iter()
-        .any(|line| line.plain().contains('\u{2022}') && line.plain().contains("user: first")));
-    // A position counter is shown; selection starts on the HEAD (row 3 of 3).
-    assert!(controls.iter().any(|line| line.plain().contains("(3/3)")));
+        .any(|line| line.plain().contains('\u{2022}') && line.plain().contains("first")));
 }
 
 #[test]
@@ -1594,7 +1821,7 @@ fn model_picker_enter_includes_selected_effort() {
 }
 
 #[test]
-fn model_picker_renders_effort_hint() {
+fn model_picker_renders_effort_row() {
     let picker = PickerState::model(
         vec![ModelOptionView {
             model: "gpt-5.2".to_string(),
@@ -1614,10 +1841,57 @@ fn model_picker_renders_effort_hint() {
         .map(UiLine::plain)
         .collect::<Vec<_>>();
 
-    assert!(controls.iter().any(|text| text.contains("thinking: none")));
-    assert!(controls
+    assert!(controls.iter().any(|text| text.starts_with("  切换模型")));
+    assert!(controls.iter().any(|text| text.contains("思考强度")
+        && text.contains("‹ 不思考 ›")
+        && text.contains("低")));
+    assert!(controls.iter().any(|text| text.contains("gpt-5.2")
+        && text.contains("400K 上下文")
+        && text.contains("当前")));
+}
+
+#[test]
+fn typing_filters_a_list_picker_and_enter_takes_the_top_match() {
+    let models = ["gpt-5.5", "claude-opus-4.5", "claude-sonnet-4.5", "kimi-k3"]
         .iter()
-        .any(|text| text.contains("gpt-5.2") && text.contains(" *")));
+        .map(|model| ModelOptionView {
+            model: model.to_string(),
+            label: None,
+            active: *model == "gpt-5.5",
+            context_window: 200_000,
+            max_output_tokens: 32_000,
+            reasoning_efforts: vec!["high".to_string()],
+            input_modalities: Vec::new(),
+        })
+        .collect();
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.picker_view = Some(PickerState::model(models, "high".to_string()));
+    let now = Instant::now();
+    for ch in "sonn".chars() {
+        app.handle_key_at(KeyCode::Char(ch), KeyModifiers::empty(), now);
+    }
+    let picker = app.state.picker_view.as_ref().unwrap();
+    assert_eq!(picker.filter, "sonn");
+    assert_eq!(picker.rows.len(), 1);
+    let document = UiBuilder::new().picker(Some(picker), 80).finish();
+    assert!(document
+        .controls
+        .iter()
+        .any(|line| line.plain().contains("1 / 4")));
+
+    // Esc clears the filter first; the picker stays open.
+    app.handle_key_at(KeyCode::Esc, KeyModifiers::empty(), now);
+    assert_eq!(app.state.picker_view.as_ref().unwrap().rows.len(), 4);
+    for ch in "sonn".chars() {
+        app.handle_key_at(KeyCode::Char(ch), KeyModifiers::empty(), now);
+    }
+    app.handle_key_at(KeyCode::Backspace, KeyModifiers::empty(), now);
+    assert_eq!(app.state.picker_view.as_ref().unwrap().filter, "son");
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), now);
+    assert_eq!(
+        app.runtime.commands.last().map(String::as_str),
+        Some("/model claude-sonnet-4.5 high")
+    );
 }
 
 #[test]
@@ -1634,26 +1908,25 @@ fn approval_picker_shows_header_context_and_options() {
         .map(UiLine::plain)
         .collect::<Vec<_>>();
 
+    assert!(controls[0].starts_with("── 需要你批准 ──"), "{controls:?}");
+    assert_eq!(UnicodeWidthStr::width(controls[0].as_str()), 80);
     let title_row = controls
         .iter()
-        .position(|text| text.contains("Approve bash"))
+        .position(|text| text == "  运行命令")
         .expect("title row");
-    assert!(controls[title_row + 1].contains("⎿  cargo test --workspace"));
-    assert!(controls.iter().any(|text| text.contains("› Allow once")));
+    assert_eq!(controls[title_row + 1], "    cargo test --workspace");
+    assert!(controls.iter().any(|text| text == "  › 1  允许这一次"));
     assert!(controls
         .iter()
-        .any(|text| text.contains("Allow bash for this session")));
-    assert!(controls.iter().any(|text| text.contains("Deny")));
-    // The key hint sits under the options as a footer.
-    let deny_row = controls
+        .any(|text| text == "    2  本会话内都允许  bash"));
+    assert!(controls.iter().any(|text| text == "    3  拒绝"));
+    assert!(controls
         .iter()
-        .position(|text| text.contains("Deny"))
-        .expect("deny row");
-    assert!(controls[deny_row + 1].contains("esc deny"));
-    // The command lives in the header context line, not on the option rows.
-    assert!(!controls
-        .iter()
-        .any(|text| text.contains("Allow once cargo test")));
+        .any(|text| text.contains("1-3 直接选") && text.contains("esc 拒绝")));
+    // The block closes with a rule in the attention colour.
+    let last = document.controls.last().unwrap();
+    assert!(last.plain().starts_with("────"));
+    assert_eq!(last.line.spans[0].style, crate::theme::warn());
 
     // Long commands truncate to a single line with an ellipsis.
     let long = PickerState::approval("call-2".to_string(), "bash".to_string(), "x".repeat(200));
@@ -1662,10 +1935,77 @@ fn approval_picker_shows_header_context_and_options() {
         .controls
         .iter()
         .map(UiLine::plain)
-        .find(|text| text.contains('⎿'))
+        .find(|text| text.starts_with("    xxx"))
         .expect("context line");
     assert!(context.ends_with('…'));
     assert!(UnicodeWidthStr::width(context.as_str()) <= 60);
+}
+
+#[test]
+fn approval_digits_pick_and_esc_denies() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    let now = Instant::now();
+    app.state.picker_view = Some(PickerState::approval(
+        "c1".to_string(),
+        "bash".to_string(),
+        "rm -rf build".to_string(),
+    ));
+    app.handle_key_at(KeyCode::Char('2'), KeyModifiers::empty(), now);
+    assert_eq!(
+        app.runtime.commands.last().map(String::as_str),
+        Some("/approve c1 allow always")
+    );
+    assert!(app.state.picker_view.is_none());
+
+    app.state.picker_view = Some(PickerState::approval(
+        "c2".to_string(),
+        "bash".to_string(),
+        "rm -rf dist".to_string(),
+    ));
+    app.handle_key_at(KeyCode::Esc, KeyModifiers::empty(), now);
+    assert_eq!(
+        app.runtime.commands.last().map(String::as_str),
+        Some("/approve c2 deny")
+    );
+}
+
+#[test]
+fn approval_request_shows_where_and_why() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    let info = lynshen_agent_core::approval::ApprovalInfo {
+        command: Some("rm -rf target/debug/incremental".to_string()),
+        cwd: std::path::PathBuf::from("/srv/repo"),
+        justification: Some("free 4 GB".to_string()),
+        prefix: Some("rm -rf".to_string()),
+        ..Default::default()
+    };
+    app.apply_events(vec![AgentEvent::ApprovalRequest {
+        call_id: "c1".to_string(),
+        name: "bash".to_string(),
+        summary: "rm".to_string(),
+        subagent_id: None,
+        hunks: None,
+        info,
+    }]);
+    // The approval takes the composer's place.
+    let document = app.build_document(80, Instant::now());
+    let controls: Vec<String> = document.controls.iter().map(UiLine::plain).collect();
+    assert!(!document
+        .controls
+        .iter()
+        .any(|line| line.kind == UiKind::Input));
+    assert!(controls
+        .iter()
+        .any(|text| text == "    rm -rf target/debug/incremental"));
+    assert!(
+        controls
+            .iter()
+            .any(|text| text == "    /srv/repo · 理由：free 4 GB"),
+        "{controls:?}"
+    );
+    assert!(controls
+        .iter()
+        .any(|text| text.contains("本会话内都允许  rm -rf 开头的命令")));
 }
 
 #[test]
@@ -1693,22 +2033,19 @@ fn effort_cycle_wraps() {
 
 #[test]
 fn approval_mode_colors_map_to_permission_level() {
+    use crate::theme;
+    use crate::ui_builder::approval_mode_label;
     assert_eq!(
-        crate::ui_builder::approval_mode_style("auto-edit").fg,
-        Some(Color::Rgb(90, 190, 140))
+        approval_mode_label("auto-edit"),
+        ("自动改文件", theme::add())
     );
+    assert_eq!(approval_mode_label("auto"), ("自动批准", theme::warn()));
     assert_eq!(
-        crate::ui_builder::approval_mode_style("auto").fg,
-        Some(Color::Rgb(230, 200, 90))
+        approval_mode_label("full-access"),
+        ("完全放开", theme::err())
     );
-    assert_eq!(
-        crate::ui_builder::approval_mode_style("full-access").fg,
-        Some(Color::Rgb(245, 90, 90))
-    );
-    assert_eq!(
-        crate::ui_builder::approval_mode_style("manual").fg,
-        Some(Color::Rgb(150, 150, 150))
-    );
+    assert_eq!(approval_mode_label("plan"), ("计划模式", theme::info()));
+    assert_eq!(approval_mode_label("manual"), ("手动批准", theme::dim()));
 }
 
 #[test]
@@ -2012,12 +2349,145 @@ fn bottom_status_shows_git_branch_with_dirty_marker() {
                 context_tokens: 1,
                 context_window: 100,
                 cost: 0.0,
+                balance: None,
             },
             64,
         )
         .finish();
     let line = document.controls.last().unwrap().plain();
-    assert!(line.starts_with("p / m (low) main*"), "{line}");
+    assert!(line.starts_with("  m 低   手动批准"), "{line}");
+    assert!(line.contains("main* · 上下文 1%"), "{line}");
+}
+
+#[test]
+fn ctrl_c_interrupts_then_clears_then_quits_on_a_second_press() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    let now = Instant::now();
+    app.apply_events(vec![AgentEvent::Connecting]);
+    assert!(!app.handle_key_at(KeyCode::Char('c'), KeyModifiers::CONTROL, now));
+    assert_eq!(app.runtime.interrupts, 1);
+
+    app.input.push_text("draft");
+    assert!(!app.handle_key_at(KeyCode::Char('c'), KeyModifiers::CONTROL, now));
+    assert!(app.input.text().is_empty());
+
+    assert!(!app.handle_key_at(KeyCode::Char('c'), KeyModifiers::CONTROL, now));
+    let document = app.build_document(80, now);
+    assert!(document
+        .controls
+        .iter()
+        .any(|line| line.plain().contains("再按一次 ctrl+c 退出")));
+    assert!(app.handle_key_at(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+        now + Duration::from_millis(500)
+    ));
+
+    // Too late: the second press only arms again.
+    let mut app = TuiApp::new(TestRuntime::default());
+    assert!(!app.handle_key_at(KeyCode::Char('c'), KeyModifiers::CONTROL, now));
+    assert!(!app.handle_key_at(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+        now + Duration::from_secs(3)
+    ));
+}
+
+#[test]
+fn ctrl_d_quits_only_on_an_empty_idle_composer() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.input.push_text("x");
+    assert!(!app.handle_key_at(KeyCode::Char('d'), KeyModifiers::CONTROL, Instant::now()));
+    app.input.clear();
+    assert!(app.handle_key_at(KeyCode::Char('d'), KeyModifiers::CONTROL, Instant::now()));
+}
+
+#[test]
+fn question_mark_on_an_empty_composer_opens_the_shortcut_sheet() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    let now = Instant::now();
+    app.handle_key_at(KeyCode::Char('?'), KeyModifiers::empty(), now);
+    assert!(app.state.show_help);
+    assert!(app.input.text().is_empty());
+    let document = app.build_document(100, now);
+    let rows: Vec<String> = document.controls.iter().map(UiLine::plain).collect();
+    assert!(rows.iter().any(|row| row.trim() == "快捷键"));
+    assert!(rows
+        .iter()
+        .any(|row| row.contains("ctrl+o") && row.contains("展开或折叠工具输出")));
+    // No status line while the sheet is open.
+    assert!(!document
+        .controls
+        .iter()
+        .any(|line| line.kind == UiKind::BottomStatus));
+
+    // Esc closes it without clearing anything else; a typed key closes it
+    // and types.
+    app.handle_key_at(KeyCode::Esc, KeyModifiers::empty(), now);
+    assert!(!app.state.show_help);
+    app.handle_key_at(KeyCode::Char('?'), KeyModifiers::empty(), now);
+    app.input.push_text("");
+    app.handle_key_at(KeyCode::Char('?'), KeyModifiers::empty(), now);
+    assert!(!app.state.show_help);
+
+    // In a sentence `?` is just text.
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.input.push_text("why");
+    app.handle_key_at(
+        KeyCode::Char('?'),
+        KeyModifiers::empty(),
+        now + Duration::from_secs(1),
+    );
+    app.flush_paste_burst_if_due(now + Duration::from_secs(2));
+    assert_eq!(app.input.text(), "why?");
+}
+
+#[test]
+fn up_and_down_walk_the_sent_messages_and_keep_the_draft() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    let now = Instant::now();
+    for message in ["first", "second"] {
+        app.input.push_text(message);
+        app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), now);
+    }
+    app.input.push_text("dra");
+    app.handle_key_at(KeyCode::Up, KeyModifiers::empty(), now);
+    assert_eq!(app.input.text(), "second");
+    app.handle_key_at(KeyCode::Up, KeyModifiers::empty(), now);
+    assert_eq!(app.input.text(), "first");
+    app.handle_key_at(KeyCode::Up, KeyModifiers::empty(), now);
+    assert_eq!(app.input.text(), "first");
+    app.handle_key_at(KeyCode::Down, KeyModifiers::empty(), now);
+    assert_eq!(app.input.text(), "second");
+    app.handle_key_at(KeyCode::Down, KeyModifiers::empty(), now);
+    assert_eq!(app.input.text(), "dra");
+}
+
+#[test]
+fn content_anchored_layout_puts_the_composer_under_a_short_transcript() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![AgentEvent::Info("hello".to_string())]);
+    let document = app.build_document(60, Instant::now());
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            let mut scroll = 0;
+            crate::terminal_renderer::draw_frame(frame.buffer_mut(), area, &document, &mut scroll);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..20)
+        .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect();
+    assert!(rows[0].starts_with("  hello"), "{rows:#?}");
+    assert!(rows[1].trim().is_empty());
+    assert!(rows[2].starts_with("────"), "{rows:#?}");
+    assert!(rows[3].starts_with("  › "), "{rows:#?}");
+    assert!(rows[4].starts_with("────"));
+    assert!(rows[5].contains("手动批准"));
+    assert!(rows[19].trim().is_empty());
 }
 
 trait TestUiBuilderExt {
@@ -2029,6 +2499,6 @@ impl TestUiBuilderExt for UiBuilder {
         for index in 0..history_lines {
             self.history_line(UiKind::Assistant, format!("line {index}"));
         }
-        self.input(&input_lines(""), &[], 0).finish()
+        self.input(&input_lines(""), None).finish()
     }
 }

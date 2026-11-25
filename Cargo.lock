@@ -1092,6 +1092,7 @@ name = "lynshen-tui"
 version = "0.8.10"
 dependencies = [
  "base64",
+ "libc",
  "lynshen-agent-core",
  "ratatui",
  "serde_json",

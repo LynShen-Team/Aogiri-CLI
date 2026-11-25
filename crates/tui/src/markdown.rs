@@ -1,12 +1,17 @@
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
+
+use crate::theme;
+
 pub(crate) const MD_BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 pub(crate) const MD_ITALIC: Style = Style::new().add_modifier(Modifier::ITALIC);
-/// Inline code reads as light-blue text on the shared background.
-pub(crate) const MD_CODE: Style = Style::new().fg(Color::Indexed(117));
-pub(crate) const MD_DIM: Style = Style::new().fg(Color::DarkGray);
+
+/// Inline code: the theme's code tone (ochre) on the shared background.
+pub(crate) fn md_code() -> Style {
+    theme::code()
+}
 
 #[derive(Clone, Copy)]
 enum MdAlign {
@@ -62,10 +67,16 @@ pub(crate) fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// Render code-block lines verbatim with a dim left gutter; no inline markdown.
+/// Render code-block lines verbatim behind a faint left rule; no inline
+/// markdown.
 fn render_code_block(code: &[&str]) -> Vec<Line<'static>> {
     code.iter()
-        .map(|line| Line::from(Span::styled(format!("│ {line}"), MD_DIM)))
+        .map(|line| {
+            Line::from(vec![
+                Span::styled("│ ", theme::faint()),
+                Span::raw((*line).to_string()),
+            ])
+        })
         .collect()
 }
 
@@ -94,7 +105,7 @@ fn render_inline(text: &str) -> Vec<Span<'static>> {
         push_emphasis(&mut spans, &rest[..start]);
         let after = &rest[start + 1..];
         if let Some(end) = after.find('`') {
-            spans.push(Span::styled(after[..end].to_string(), MD_CODE));
+            spans.push(Span::styled(after[..end].to_string(), md_code()));
             rest = &after[end + 1..];
         } else {
             spans.push(Span::raw("`".to_string()));

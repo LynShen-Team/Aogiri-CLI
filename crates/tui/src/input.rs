@@ -42,10 +42,7 @@ impl InputBuffer {
         for cell in &self.cells {
             match cell {
                 Cell::Char(ch) => display.push(*ch),
-                Cell::LargePaste(paste) => {
-                    let char_count = paste.chars().count();
-                    display.push_str(&format!("[Pasted: {char_count} chars]"));
-                }
+                Cell::LargePaste(paste) => display.push_str(&paste_placeholder(paste)),
             }
         }
         display
@@ -89,7 +86,7 @@ impl InputBuffer {
                     width += ch.width().unwrap_or(0);
                 }
                 Cell::LargePaste(paste) => {
-                    let placeholder = format!("[Pasted: {} chars]", paste.chars().count());
+                    let placeholder = paste_placeholder(paste);
                     width += UnicodeWidthStr::width(placeholder.as_str());
                     text.push_str(&placeholder);
                 }
@@ -247,6 +244,16 @@ impl InputBuffer {
 
     pub(crate) fn move_document_end(&mut self, extend: bool) {
         self.set_cursor(self.cells.len(), extend);
+    }
+
+    /// The caret is on the first line (Up recalls history from here).
+    pub(crate) fn cursor_on_first_line(&self) -> bool {
+        self.line_start(self.cursor) == 0
+    }
+
+    /// The caret is on the last line (Down moves forward in history).
+    pub(crate) fn cursor_on_last_line(&self) -> bool {
+        self.line_end(self.cursor) >= self.cells.len()
     }
 
     pub(crate) fn move_up(&mut self, extend: bool) {
@@ -489,6 +496,19 @@ impl PasteBurst {
     }
 }
 
+/// The chip a large paste shows as: `[已粘贴 12 行]` / `[Pasted 12 lines]`,
+/// or characters for a single long line.
+pub(crate) fn paste_placeholder(paste: &str) -> String {
+    let lines = paste.lines().count();
+    let chars = paste.chars().count();
+    match (crate::lang::is_zh(), lines > 1) {
+        (true, true) => format!("[已粘贴 {lines} 行]"),
+        (true, false) => format!("[已粘贴 {chars} 字]"),
+        (false, true) => format!("[Pasted {lines} lines]"),
+        (false, false) => format!("[Pasted {chars} chars]"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,10 +531,7 @@ mod tests {
 
         assert_eq!(
             input.display_text(),
-            format!(
-                "prefix [Pasted: {} chars] suffix",
-                PASTE_PLACEHOLDER_CHARS + 1
-            )
+            format!("prefix [已粘贴 {} 字] suffix", PASTE_PLACEHOLDER_CHARS + 1)
         );
         assert_eq!(input.text(), format!("prefix {pasted} suffix"));
     }

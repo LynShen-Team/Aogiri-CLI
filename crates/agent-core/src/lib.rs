@@ -200,6 +200,67 @@ pub fn env_proxy(url: &str) -> Option<String> {
     web_fetch::env_proxy(url)
 }
 
+/// The signed-in LynShen account as a client header shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummary {
+    pub email: String,
+    /// The balance as the gateway states it (a decimal string).
+    pub balance: Option<String>,
+    /// ISO currency code of the balance, e.g. `CNY`.
+    pub currency: Option<String>,
+    /// The active plan's name, None without one.
+    pub plan: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountLookup {
+    /// The configured provider is not the LynShen gateway.
+    NotLynShen,
+    /// The provider is LynShen but no one is signed in.
+    SignedOut,
+    Summary(AccountSummary),
+    Failed(String),
+}
+
+/// Looks up the account behind the LynShen provider (`/v1/oauth/userinfo`).
+/// Blocking (a token refresh and one request): call it off the UI thread.
+pub fn lynshen_account() -> AccountLookup {
+    let Ok(config) = config::Config::load_existing() else {
+        return AccountLookup::NotLynShen;
+    };
+    if config.provider != "lynshen" {
+        return AccountLookup::NotLynShen;
+    }
+    let Ok((api, token, _)) = gateway_credentials(config) else {
+        return AccountLookup::SignedOut;
+    };
+    match oauth::get_json(&api, "/v1/oauth/userinfo", &token) {
+        Ok(value) => {
+            let text = |value: &serde_json::Value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| value.as_f64().map(|number| number.to_string()))
+                    .filter(|text| !text.trim().is_empty())
+            };
+            AccountLookup::Summary(AccountSummary {
+                email: value
+                    .get("email")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                balance: value.get("balance").and_then(text),
+                currency: value.get("currency").and_then(text),
+                plan: value
+                    .get("active_plan")
+                    .and_then(|plan| plan.get("name"))
+                    .and_then(text),
+            })
+        }
+        Err(error) => AccountLookup::Failed(error),
+    }
+}
+
 /// Names the app in the device label of the next LynShen login.
 pub fn set_login_client_label(label: &'static str) {
     oauth::set_client_label(label);
