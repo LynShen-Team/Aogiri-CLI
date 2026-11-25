@@ -60,7 +60,8 @@ function Get-UserPathEntries {
 function Count-InUserPath { @(Get-UserPathEntries | Where-Object { $_.TrimEnd('\') -ieq $dir }).Count }
 # What people type, in this session. Write-Host is stream 6.
 function Install-ViaIex { (Invoke-RestMethod "$base/install.ps1" | Invoke-Expression) 6>&1 | ForEach-Object { "$_" } }
-function Invoke-WithArgs([string[]]$Arguments) {
+# With parameters, as the README shows: & ([scriptblock]::Create((irm ...))) -Uninstall
+function Invoke-WithArgs([hashtable]$Arguments) {
     $block = [scriptblock]::Create((Invoke-RestMethod "$base/install.ps1"))
     (& $block @Arguments) 6>&1 | ForEach-Object { "$_" }
 }
@@ -91,17 +92,17 @@ Stop-Process -Id $running.Id -Force
 $running.WaitForExit()
 
 New-Item -ItemType File -Path (Join-Path $dir 'other-tool.txt') | Out-Null
-$out = Invoke-WithArgs @('-Uninstall')
+$out = Invoke-WithArgs @{ Uninstall = $true }
 Show $out
 Check '-Uninstall removes lynshen.exe' { -not (Test-Path -LiteralPath $exe) -and -not (Test-Path -LiteralPath (Join-Path $dir 'lynshen.old.exe')) }
 Check 'a folder with other programs stays on PATH' { (Count-InUserPath) -eq 1 -and ($out -match 'Kept') }
 Remove-Item -LiteralPath (Join-Path $dir 'other-tool.txt')
-$out = Invoke-WithArgs @('-Uninstall')
+$out = Invoke-WithArgs @{ Uninstall = $true }
 Check 'an empty folder leaves PATH' { (Count-InUserPath) -eq 0 -and -not (Test-Path -LiteralPath $dir) }
 
-$out = Invoke-WithArgs @('-Version', $Version, '-NoModifyPath')
+$out = Invoke-WithArgs @{ Version = $Version; NoModifyPath = $true }
 Check '-Version and -NoModifyPath' { (Test-Path -LiteralPath $exe) -and (Count-InUserPath) -eq 0 }
-Invoke-WithArgs @('-Uninstall') | Out-Null
+Invoke-WithArgs @{ Uninstall = $true } | Out-Null
 
 $env:LYNSHEN_DOWNLOAD_BASE = ($base -replace '/cli$', '/bad')
 $env:LYNSHEN_VERSION = $Version
@@ -117,7 +118,7 @@ $shell = (Get-Process -Id $PID).Path
 Check 'run as a file, a failure exits 1' { $LASTEXITCODE -eq 1 }
 $out = & $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $cli 'install.ps1') 2>&1 | ForEach-Object { "$_" }
 Check 'run as a file, it says to open a new terminal' { $LASTEXITCODE -eq 0 -and $out[-1] -eq 'Next: open a new terminal, then run lynshen' }
-Invoke-WithArgs @('-Uninstall') | Out-Null
+Invoke-WithArgs @{ Uninstall = $true } | Out-Null
 Check 'clean at the end' { (Count-InUserPath) -eq 0 -and -not (Test-Path -LiteralPath $dir) }
 
 Stop-Process -Id $server.Id -Force

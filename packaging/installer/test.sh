@@ -72,7 +72,10 @@ for shell in "$@"; do
 	cp "$rc" "$home/rc.before"
 	echo "== $shell"
 	in_home() {
-		env HOME="$home" SHELL="$shell_path" PATH="$clean_path" LYNSHEN_DOWNLOAD_BASE="$base" "$@"
+		# XDG_CONFIG_HOME and ZDOTDIR would point the shells (and the installer)
+		# outside the throwaway HOME.
+		env -u XDG_CONFIG_HOME -u ZDOTDIR HOME="$home" SHELL="$shell_path" PATH="$clean_path" \
+			LYNSHEN_DOWNLOAD_BASE="$base" "$@"
 	}
 	out=$(in_home bash -c "curl -fsSL $base/install.sh | bash" 2>&1)
 	check "curl | bash installs" '[ $? = 0 ] && [ -x "$home/.local/bin/lynshen" ]'
@@ -100,6 +103,7 @@ for shell in "$@"; do
 done
 
 echo "== failures"
+unset XDG_CONFIG_HOME ZDOTDIR
 home=$(mktemp -d)
 out=$(env HOME="$home" SHELL=/bin/sh LYNSHEN_DOWNLOAD_BASE="${base%/cli}/bad" bash "$here/install.sh" --version "$version" 2>&1)
 check "a checksum mismatch fails" '[ $? = 1 ] && echo "$out" | grep -q "checksum mismatch"'
