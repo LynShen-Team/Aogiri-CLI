@@ -30,6 +30,7 @@ mod schedules;
 mod scopes;
 mod session;
 mod session_messages;
+mod session_provider;
 mod skill_market;
 mod skills;
 mod store;
@@ -238,6 +239,17 @@ impl Link for WebSocket<TcpStream> {
     }
 }
 
+/// What the daemon offers beyond the engine's own `features` (see `pump`).
+const FEATURES: [&str; 7] = [
+    "fork",
+    "engine_probe",
+    "tool_providers",
+    "acp_presets",
+    "term_attach",
+    "schedule_runs",
+    "session_provider",
+];
+
 /// Serves one authenticated client over `link` until either side closes.
 /// `device` is the paired device it authenticated as; None for a local
 /// client.
@@ -257,18 +269,12 @@ fn pump(
 ) -> Result<(), String> {
     // The daemon also forks conversations and probes engines (B08), runs
     // custom providers, built-in ACP agents and session terminals any client
-    // attaches to (B10), and keeps scheduled runs with failures, budgets and
-    // worktrees (B12); a client checks for them before it offers any.
+    // attaches to (B10), keeps scheduled runs with failures, budgets and
+    // worktrees (B12), and runs a LynShen session on a provider of its own
+    // (`session_provider`); a client checks for them before it offers any.
     let mut hello = protocol::hello_json(hub.version);
     if let Some(features) = hello["features"].as_array_mut() {
-        features.extend([
-            json!("fork"),
-            json!("engine_probe"),
-            json!("tool_providers"),
-            json!("acp_presets"),
-            json!("term_attach"),
-            json!("schedule_runs"),
-        ]);
+        features.extend(FEATURES.map(|feature| json!(feature)));
     }
     for frame in [
         hello,
@@ -1188,4 +1194,12 @@ fn respond(hub: &Hub, client: u64, request: &Value, result: Result<Value, String
         frame["id"] = request.clone();
     }
     hub.send_to(client, &frame);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_hello_offers_a_session_on_its_own_provider() {
+        assert!(super::FEATURES.contains(&"session_provider"));
+    }
 }

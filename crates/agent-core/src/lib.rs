@@ -42,6 +42,7 @@ pub mod sandbox;
 mod search;
 mod secrets;
 mod session;
+pub mod session_provider;
 pub mod shell;
 pub mod skills;
 pub mod styles;
@@ -68,6 +69,7 @@ pub use event::{
 pub use hooks::HookStopper;
 pub use hunks::HunkView;
 pub use session::{release_session_locks, SessionSummary};
+pub use session_provider::SessionProvider;
 pub use tokens::release_idle_tokenizers;
 pub use tools::{git_diff, terminate_tool_processes};
 
@@ -83,6 +85,14 @@ pub fn lynshen_gateway_credentials() -> Result<(String, String), String> {
 pub fn lynshen_session() -> Result<(String, String, u64), String> {
     let config = config::Config::load_or_create().map_err(|error| error.to_string())?;
     gateway_credentials(config)
+}
+
+/// The account's LynShen gateway (`lynshen_api_url`) as config.json names it
+/// now; read, never rewritten. None when the file cannot be read.
+pub fn lynshen_api_url() -> Option<String> {
+    config::Config::load_existing()
+        .ok()
+        .map(|config| config.lynshen_api_url)
 }
 
 /// The same for each request of the daemon's local gateway: config.json is

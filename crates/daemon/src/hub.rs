@@ -692,6 +692,13 @@ impl Hub {
         if engine.is_some() && agent.is_some() {
             return Err("agents run on the lynshen engine".to_string());
         }
+        // LynShen on a provider of its own, checked before anything starts.
+        let provider = crate::session_provider::for_new(
+            &options.provider,
+            engine.is_none(),
+            agent.is_some(),
+            &crate::session_provider::gateway(),
+        )?;
         let mut agent_project: Option<String> = None;
         let cwd = match agent {
             None if chat => {
@@ -770,8 +777,14 @@ impl Hub {
                     ),
                     None => None,
                 };
-                let (id, ops, generation, stopper) =
-                    session::spawn(Arc::clone(self), cwd.clone(), resume, agent.clone(), dirs)?;
+                let (id, ops, generation, stopper) = session::spawn(
+                    Arc::clone(self),
+                    cwd.clone(),
+                    resume,
+                    agent.clone(),
+                    dirs,
+                    provider.clone(),
+                )?;
                 hook_stopper = Some(stopper);
                 (id, ops, generation)
             }
@@ -798,6 +811,11 @@ impl Hub {
             self.store
                 .record_session_meta(&id, &json!({ "tool_provider": provider }))
                 .map_err(|error| error.to_string())?;
+        }
+        // Kept with it before it is hosted: a session that could not keep it
+        // stops here rather than reopen later on the account's provider.
+        if provider.is_some() {
+            self.keep_session_provider(&id, provider.as_ref())?;
         }
         // Which of the desktop's ACP agents runs it: a client can start it again.
         if let Some(acp_agent) = acp_agent {
@@ -969,6 +987,7 @@ impl Hub {
                     worktree: None,
                     parent: None,
                     tool_provider: None,
+                    session_provider: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
@@ -982,17 +1001,44 @@ impl Hub {
         let mut gateway = false;
         let mut tool_provider = None;
         let mut hook_stopper = None;
+        // A provider the client named, or dropped, to keep with the session.
+        let mut keep_provider = None;
         let (ops, generation) = match kind {
             None => {
+                // The provider the client names, else the one it kept (see
+                // `session_provider`); an agent's session runs on the account's.
+                if record.agent.is_some()
+                    && matches!(options.provider, crate::session_provider::Request::Set(_))
+                {
+                    return Err("an agent's sessions run on the account's provider".to_string());
+                }
+                let kept = record
+                    .session_provider
+                    .as_ref()
+                    .map(|kept| crate::session_provider::restore(id, kept));
+                let provider = crate::session_provider::for_open(
+                    &options.provider,
+                    kept,
+                    &crate::session_provider::gateway(),
+                )?;
+                if options.provider != crate::session_provider::Request::Keep
+                    && (provider.is_some() || record.session_provider.is_some())
+                {
+                    keep_provider = Some(provider.clone());
+                }
                 let (_, ops, generation, stopper) = session::spawn(
                     Arc::clone(self),
                     record.cwd.clone(),
                     Some(id.to_string()),
                     record.agent.clone(),
                     dirs,
+                    provider,
                 )?;
                 hook_stopper = Some(stopper);
                 (ops, generation)
+            }
+            Some(_) if options.provider != crate::session_provider::Request::Keep => {
+                return Err("options.provider is for LynShen sessions".to_string());
             }
             Some(kind) => {
                 // A conversation with no turn yet was never saved: start it
@@ -1132,6 +1178,11 @@ impl Hub {
                 .record_session_meta(id, &json!({ "tool_provider": provider }))
                 .map_err(|error| error.to_string())?;
         }
+        // Before it is hosted: a session that could not keep its provider
+        // stops here rather than reopen later on the account's.
+        if let Some(provider) = keep_provider {
+            self.keep_session_provider(id, provider.as_ref())?;
+        }
         self.host(id.to_string(), ops, record.cwd, generation);
         self.set_hook_stopper(id, hook_stopper);
         lock(&self.asleep).remove(id);
@@ -1239,6 +1290,21 @@ impl Hub {
     /// for the engine that opens it next.
     pub(crate) fn take_kept(&self, id: &str) -> Option<KeptState> {
         lock(&self.kept).remove(id)
+    }
+
+    /// Keeps the provider session `id` runs on instead of the account's
+    /// (None: the account's again): the record without the key, then the
+    /// key (see `session_provider`).
+    pub(crate) fn keep_session_provider(
+        &self,
+        id: &str,
+        provider: Option<&lynshen_agent_core::SessionProvider>,
+    ) -> Result<(), String> {
+        let kept = provider.map_or(Value::Null, crate::session_provider::record);
+        self.store
+            .record_session_meta(id, &json!({ "session_provider": kept }))
+            .map_err(|error| error.to_string())?;
+        crate::session_provider::save_key(id, provider.map(|provider| provider.api_key.as_str()))
     }
 
     /// A number unique to one engine thread, tying it to its `Hosted` entry.
@@ -2505,6 +2571,11 @@ impl Hub {
         let Some(record) = self.auto_titled(session) else {
             return;
         };
+        // The title model runs on the account's provider: a conversation on
+        // a provider of its own keeps its first-line title.
+        if record.session_provider.is_some() {
+            return;
+        }
         let Some(hub) = self.me.upgrade() else {
             return;
         };
@@ -2985,6 +3056,7 @@ mod tests {
             worktree: None,
             parent: None,
             tool_provider: None,
+            session_provider: None,
         };
         assert_eq!(
             shown_title(&record, Some(&scheduled)).as_deref(),
@@ -3533,6 +3605,71 @@ mod tests {
             hub.broadcast(&json!({ "type": "x" }));
         }
         assert!(lock(&hub.clients).contains_key(&chat));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `session_provider`: what a session kept comes back with that session
+    /// alone, across a daemon restart, until it is dropped (its key too).
+    #[test]
+    fn a_kept_provider_belongs_to_its_session_and_comes_back_with_it() {
+        use crate::session_provider::{for_open, record, restore, Request};
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-session-provider-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let open = || {
+            Hub::new(
+                Store::open(dir.join("daemon")).unwrap(),
+                Agents::open(dir.join("agents")).unwrap(),
+                "test",
+                None,
+            )
+        };
+        let Request::Set(provider) = Request::from_options(&json!({ "provider": {
+            "id": "cyber-egg", "name": "赛博鸡蛋", "base_url": "https://api.lynshen.org/new/v1",
+            "protocol": "chat", "api_key": "sk-egg-hub-test",
+            "models": [{ "name": "egg-pro" }], "model": "egg-pro",
+        } })) else {
+            panic!("not a provider");
+        };
+        let gateway = "https://api.lynshen.org";
+        let reopened = |hub: &Hub, id: &str| {
+            let record = hub
+                .store
+                .sessions()
+                .into_iter()
+                .find(|record| record.id == id)
+                .unwrap();
+            let kept = record
+                .session_provider
+                .as_ref()
+                .map(|kept| restore(id, kept));
+            for_open(&Request::Keep, kept, gateway)
+        };
+        let hub = open();
+        for id in ["sp-egg", "sp-plain"] {
+            hub.store
+                .record_engine_session(id, std::path::Path::new("/tmp"), None, None, false, None)
+                .unwrap();
+        }
+        hub.keep_session_provider("sp-egg", Some(&provider))
+            .unwrap();
+        assert_eq!(reopened(&hub, "sp-egg"), Ok(Some(provider.clone())));
+        assert_eq!(reopened(&hub, "sp-plain"), Ok(None));
+        drop(hub);
+
+        // The daemon again, its log compacted on open.
+        let hub = open();
+        assert_eq!(reopened(&hub, "sp-egg"), Ok(Some(provider.clone())));
+        assert_eq!(reopened(&hub, "sp-plain"), Ok(None));
+        let logged = fs::read_to_string(dir.join("daemon").join("sessions.jsonl")).unwrap();
+        assert!(logged.contains("cyber-egg") && !logged.contains("sk-egg-hub-test"));
+
+        hub.keep_session_provider("sp-egg", None).unwrap();
+        assert_eq!(reopened(&hub, "sp-egg"), Ok(None));
+        assert!(restore("sp-egg", &record(&provider)).is_err());
+        drop(hub);
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -5,7 +5,7 @@
 use crate::hub::Hub;
 use lynshen_agent_core::{
     protocol::{self, session_event_json},
-    AgentCore, AgentEvent, ApprovalMode, HookStopper,
+    AgentCore, AgentEvent, ApprovalMode, HookStopper, SessionProvider,
 };
 use serde_json::{json, Value};
 use std::{
@@ -40,7 +40,8 @@ const IDLE_POLL: Duration = Duration::from_millis(250);
 
 /// Opens an engine in `cwd` (resuming `resume` when given), which may also
 /// write in `dirs` (its project's other folders), on a new thread, set up
-/// for `agent` when the session belongs to one. Returns the session
+/// for `agent` when the session belongs to one, on `provider` instead of
+/// the account's when given (`session_provider`). Returns the session
 /// id once the engine is ready, with the thread's generation (see
 /// `Hub::session_ended`) and its engine's hook stopper (see
 /// `Hub::set_hook_stopper`), or the open error.
@@ -50,12 +51,21 @@ pub fn spawn(
     resume: Option<String>,
     agent: Option<String>,
     dirs: Vec<PathBuf>,
+    provider: Option<SessionProvider>,
 ) -> Result<(String, Sender<Value>, u64, HookStopper), String> {
     let (ops_tx, ops_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let generation = hub.next_generation();
     thread::spawn(move || {
-        let core = match open(&hub, cwd, resume.as_deref(), agent.as_deref(), &dirs) {
+        let opened = open(
+            &hub,
+            cwd,
+            resume.as_deref(),
+            agent.as_deref(),
+            &dirs,
+            provider,
+        );
+        let core = match opened {
             Ok(core) => core,
             Err(error) => {
                 let _ = ready_tx.send(Err(error));
@@ -79,6 +89,7 @@ fn open(
     resume: Option<&str>,
     agent: Option<&str>,
     dirs: &[PathBuf],
+    provider: Option<SessionProvider>,
 ) -> Result<AgentCore, String> {
     let mut core = AgentCore::open(cwd)
         .map_err(|error| error.to_string())?
@@ -93,6 +104,9 @@ fn open(
         Some(id) => resume_session(hub, &mut core, id),
     };
     result?;
+    if let Some(provider) = provider {
+        core.set_session_provider(provider);
+    }
     let session = core.session_id().to_string();
     let mut host = None;
     if let Some(agent) = agent.and_then(|id| hub.agents.get(id)) {
@@ -272,6 +286,14 @@ fn terminal(
         hub.send_to(client, &error);
     };
     let mut core = core;
+    // The TUI would open the conversation on the account's provider.
+    if let Some(provider) = core.session_provider() {
+        refuse(format!(
+            "this conversation runs on {} and cannot open in the terminal",
+            provider.name
+        ));
+        return Some(core);
+    }
     if hub.is_busy(id) {
         // `force`: the user agreed to cut the running turn short.
         if request["force"] != true {
@@ -344,7 +366,7 @@ fn terminal(
         Err(error) => refuse(error),
     }
     let dirs = crate::projects::extra_dirs(&arc, &cwd, &crate::projects::of_session(&arc, id));
-    match open(&arc, cwd, Some(id), None, &dirs) {
+    match open(&arc, cwd, Some(id), None, &dirs, None) {
         Ok(core) => {
             hub.broadcast(&json!({ "type": "surface", "surface": "gui", "session": id }));
             for event in core.state_events() {
@@ -389,7 +411,21 @@ fn apply(hub: &Hub, core: &mut AgentCore, id: &str, op: &Value) -> bool {
         }
     }
     hub.note_sent_images(id, op);
+    let provider = core.session_provider().cloned();
     let (quit, events) = protocol::apply_op(core, op);
+    // A `/model` on the session's own provider, or one it does not serve
+    // (back on the account's): kept with the session for its next engine.
+    if core.session_provider() != provider.as_ref() {
+        if let Err(error) = hub.keep_session_provider(id, core.session_provider()) {
+            publish(
+                hub,
+                id,
+                AgentEvent::Error(format!(
+                    "could not keep this conversation's provider: {error}"
+                )),
+            );
+        }
+    }
     if op["claimed"] == true {
         hub.release_claim(id);
     }
