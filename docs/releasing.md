@@ -3,6 +3,10 @@
 LynShen CLI follows the same distribution shape as Codex CLI:
 
 - GitHub Releases are the canonical native artifacts.
+- The LynShen software library (`software.lynshen.org/cli`, docs/software-library.md) serves the same binaries, the
+  self-update manifest and the one-line installers (`install.sh`, `install.ps1`).
+- Homebrew: the tap `LynShen-Team/homebrew-tap` (`brew install lynshen-team/tap/lynshen`) downloads the binaries
+  from the software library.
 - npm is a convenience install channel for the native binaries.
 - The public npm entrypoint is `@lynshen/cli`.
 
@@ -48,6 +52,16 @@ one.
 4. The macOS workflow publishes `@lynshen/cli` last, once npm serves all four platform packages of this version.
 5. Once npm serves the version, check that all five packages carry a provenance statement (see "Checking a
    release" below).
+6. Once both workflows have finished, publish the release to the software library from the release machine with
+   `deploy/software-library/publish.sh cli X.Y.Z <dir with the four binaries and the notices>`, run from a checkout
+   of the tag (docs/software-library.md). It adds the installers and `SHA256SUMS`; the server then serves the new
+   installers at `/cli/install.sh` and `/cli/install.ps1`.
+7. Update the Homebrew tap: `gh workflow run update.yml -R LynShen-Team/homebrew-tap`. It rewrites
+   `Formula/lynshen.rb` from the new `latest.json`, installs it with brew on macOS and Linux, and pushes it. (It also
+   runs every hour on its own.)
+8. Check the installers: `curl -fsSL https://software.lynshen.org/cli/install.sh | head -3`, and in a throwaway
+   HOME, `curl -fsSL https://software.lynshen.org/cli/install.sh | HOME=$(mktemp -d) SHELL=/bin/zsh bash` should
+   install X.Y.Z.
 
 ### npm needs minutes to serve a new version
 

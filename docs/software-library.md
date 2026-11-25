@@ -6,6 +6,9 @@ CLI updates from it; nothing else is needed on the server.
 ```
 /cli/latest.json            signed manifest of the newest release (never cached)
 /cli/<version>/<file>       release files (immutable)
+/cli/<version>/SHA256SUMS   sha256 of every other file of the release
+/cli/install.sh             the newest release's installers (never cached)
+/cli/install.ps1
 /skills/latest.json         the skills mirror's signed manifest (see below)
 /skills/<version>/<file>    catalog.json and one archive per skill
 ```
@@ -37,6 +40,40 @@ expects.
   runs from the next start. `auto_update: false` in `config.json` turns this
   off; the CLI then only prints a notice.
 - `lynshen update` does the same in the foreground.
+
+## Installers
+
+`curl -fsSL https://software.lynshen.org/cli/install.sh | bash` (macOS, Linux)
+and `irm https://software.lynshen.org/cli/install.ps1 | iex` (Windows) install
+the CLI in `~/.local/bin` and put that folder on PATH. The scripts live in
+`packaging/installer/` (their options are at the top of each file;
+`packaging/installer/test.sh` and `test.ps1` test them end to end, on CI in
+`.github/workflows/installers.yml`).
+
+- They read the version from `latest.json` (or `LYNSHEN_VERSION`), the
+  expected sha256 from `/cli/<version>/SHA256SUMS`, download
+  `/cli/<version>/lynshen-<target>`, check it, run it with `--version`, and
+  only then put it in place. They do not check the manifest's signature: they
+  come from the same server over HTTPS, so it would add nothing.
+- Not `~/.lynshen/bin`: LynShen Desktop owns that folder, and the CLI treats
+  a binary there as Desktop's (no self-update). A binary in `~/.local/bin`
+  updates itself like any release binary.
+- On macOS and Linux they add one block, between `# >>> lynshen installer >>>`
+  and `# <<< lynshen installer <<<`, to the login shell's startup file: zsh
+  `.zshrc`, bash `.bashrc` plus the login file bash reads (`.bash_profile`,
+  `.bash_login` or `.profile`), fish `config.fish`. `--uninstall` removes the
+  blocks. On Windows they add the folder to the user PATH (REG_EXPAND_SZ kept)
+  and remove it on `-Uninstall` only when nothing else is left in it.
+- Versions published before the installers (0.8.10 and older) have no
+  `SHA256SUMS` and cannot be installed with them.
+
+`publish.sh cli` adds `install.sh`, `install.ps1` (from the checkout it runs
+in, which is the release tag) and `SHA256SUMS` to the files it signs, so every
+release carries its own installers. `receive-software.py` then copies the new
+release's installers to `/cli/install.sh` and `/cli/install.ps1`. The Caddy
+site serves those two with `Cache-Control: no-cache` and
+`Content-Type: text/plain; charset=utf-8` (Windows PowerShell reads text
+without a charset as Latin-1).
 
 ## Keys
 

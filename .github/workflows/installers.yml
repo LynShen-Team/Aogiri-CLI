@@ -1,0 +1,74 @@
+name: Installers
+
+# install.sh and install.ps1 (packaging/installer) end to end on real macOS,
+# Linux and Windows: the newest published binary from the software library,
+# served on localhost with this checkout's installers (test.sh, test.ps1).
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - packaging/installer/**
+      - .github/workflows/installers.yml
+  push:
+    branches:
+      - main
+    paths:
+      - packaging/installer/**
+      - .github/workflows/installers.yml
+
+jobs:
+  unix:
+    name: install.sh (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            file: lynshen-x86_64-unknown-linux-gnu
+            shells: bash zsh fish
+          - os: macos-latest
+            file: lynshen-aarch64-apple-darwin
+            shells: zsh bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zsh and fish
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
+
+      - name: Download the newest lynshen
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(curl -fsS https://software.lynshen.org/cli/latest.json | python3 -c 'import json, sys; print(json.loads(json.load(sys.stdin)["release"])["version"])')
+          curl -fsSL -o "$RUNNER_TEMP/lynshen" "https://software.lynshen.org/cli/$version/${{ matrix.file }}"
+          echo "LYNSHEN_TEST_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Test install.sh
+        run: bash packaging/installer/test.sh "$RUNNER_TEMP/lynshen" "$LYNSHEN_TEST_VERSION" ${{ matrix.shells }}
+
+  windows:
+    name: install.ps1 (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows PowerShell 5.1 and PowerShell 7.
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the newest lynshen
+        shell: pwsh
+        run: |
+          $manifest = Invoke-RestMethod https://software.lynshen.org/cli/latest.json
+          $version = ($manifest.release | ConvertFrom-Json).version
+          Invoke-WebRequest -Uri "https://software.lynshen.org/cli/$version/lynshen-x86_64-pc-windows-msvc.exe" -OutFile "$env:RUNNER_TEMP\lynshen.exe"
+          "LYNSHEN_TEST_VERSION=$version" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Test install.ps1
+        shell: pwsh
+        run: |
+          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File .\packaging\installer\test.ps1 -Binary "$env:RUNNER_TEMP\lynshen.exe" -Version $env:LYNSHEN_TEST_VERSION
+          exit $LASTEXITCODE

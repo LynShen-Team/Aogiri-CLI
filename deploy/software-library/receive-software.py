@@ -32,6 +32,11 @@ NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 VERSION = re.compile(r'\d+\.\d+\.\d+')
 MAX_BYTES = 1024**3
 MAX_ENTRIES = 1024
+# Files of the newest release that are also served from the product folder:
+# people install with `curl -fsSL https://software.lynshen.org/cli/install.sh
+# | bash` (or install.ps1 on Windows), and every release keeps its own copy in
+# <version>/.
+CURRENT_FILES = {'cli': ('install.sh', 'install.ps1')}
 
 
 def verify(manifest):
@@ -119,18 +124,25 @@ def publish(stage, root, version):
             for path in (stage / version).iterdir():
                 path.chmod(0o644)
             shutil.move(str(stage / version), destination)
-        fd, filename = tempfile.mkstemp(prefix='.manifest-', dir=root)
-        try:
-            with os.fdopen(fd, 'wb') as output:
-                output.write((stage / 'latest.json').read_bytes())
-                output.flush()
-                os.fsync(output.fileno())
-            os.chmod(filename, 0o644)
-            os.replace(filename, current)
-        finally:
-            if os.path.exists(filename):
-                os.unlink(filename)
+        for name in CURRENT_FILES.get(root.name, ()):
+            if (destination / name).is_file():
+                write_atomically(root / name, (destination / name).read_bytes())
+        write_atomically(current, (stage / 'latest.json').read_bytes())
     print(f'Published {root.name} {version}')
+
+
+def write_atomically(path, data):
+    fd, filename = tempfile.mkstemp(prefix='.write-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(filename, 0o644)
+        os.replace(filename, path)
+    finally:
+        if os.path.exists(filename):
+            os.unlink(filename)
 
 
 if __name__ == '__main__':
