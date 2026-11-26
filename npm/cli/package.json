@@ -1,6 +1,6 @@
 {
   "name": "@lynshen/cli",
-  "version": "0.8.13",
+  "version": "0.8.14",
   "description": "LynShen native CLI",
   "license": "Apache-2.0",
   "repository": {
@@ -20,10 +20,10 @@
     "THIRD-PARTY-NOTICES.txt"
   ],
   "optionalDependencies": {
-    "@lynshen/cli-linux-x64": "0.8.13",
-    "@lynshen/cli-win32-x64": "0.8.13",
-    "@lynshen/cli-darwin-arm64": "0.8.13",
-    "@lynshen/cli-darwin-x64": "0.8.13"
+    "@lynshen/cli-linux-x64": "0.8.14",
+    "@lynshen/cli-win32-x64": "0.8.14",
+    "@lynshen/cli-darwin-arm64": "0.8.14",
+    "@lynshen/cli-darwin-x64": "0.8.14"
   },
   "engines": {
     "node": ">=18"
