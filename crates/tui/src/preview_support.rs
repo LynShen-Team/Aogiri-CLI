@@ -96,6 +96,105 @@ pub fn render_indicator_frames(
     Value::Array(frames)
 }
 
+/// The working indicator through each of its eight motions in turn,
+/// `state_ms` each, one frame every `step_ms` (the frame name is the
+/// state's): thinking, writing, a command, reading, editing, an approval
+/// waiting on the user, compacting, reconnecting. The turn began 41 s
+/// before the first frame.
+pub fn render_indicator_states(state_ms: u64, step_ms: u64, width: u16, height: u16) -> Value {
+    const STATES: [&str; 8] = [
+        "think",
+        "write",
+        "run",
+        "read",
+        "edit",
+        "wait",
+        "compact",
+        "reconnect",
+    ];
+    let themes = [
+        (
+            "dark",
+            Theme::new(ColorDepth::TrueColor, Some((22, 21, 19))),
+        ),
+        (
+            "light",
+            Theme::new(ColorDepth::TrueColor, Some((251, 250, 247))),
+        ),
+    ];
+    let mut frames = Vec::new();
+    for (theme_name, theme) in themes {
+        theme::with_theme(theme, || {
+            let (mut state, mut input) = working();
+            let started = Instant::now();
+            state.activity.turn_started_at = Some(started);
+            state.activity.phase_started_at = Some(started);
+            let count = state_ms * STATES.len() as u64 / step_ms;
+            let mut current = usize::MAX;
+            for step in 0..count {
+                let ms = step * step_ms;
+                let now = started + Duration::from_millis(41_000 + ms);
+                // Asked 400 ms (the debounce) before the caption changes,
+                // so the new motion shows with it.
+                let index = (((ms + crate::working_indicator::DEBOUNCE.as_millis() as u64)
+                    / state_ms) as usize)
+                    .min(STATES.len() - 1);
+                if index != current {
+                    current = index;
+                    state.picker_view = None;
+                    let activity = &mut state.activity;
+                    activity.phase_started_at = Some(now);
+                    match STATES[index] {
+                        "think" => activity.kind = ActivityKind::Thinking,
+                        "write" => activity.kind = ActivityKind::Output,
+                        "run" | "wait" => {
+                            activity.kind = ActivityKind::Tool;
+                            activity.tool = crate::working_indicator::tool_kind("bash");
+                        }
+                        "read" => {
+                            activity.kind = ActivityKind::Tool;
+                            activity.tool = crate::working_indicator::tool_kind("ripgrep");
+                        }
+                        "edit" => {
+                            activity.kind = ActivityKind::Tool;
+                            activity.tool = crate::working_indicator::tool_kind("str_replace");
+                        }
+                        "compact" => activity.kind = ActivityKind::Compacting,
+                        _ => activity.kind = ActivityKind::Reconnecting { attempt: 2 },
+                    }
+                    if STATES[index] == "wait" {
+                        state.apply_events(
+                            vec![AgentEvent::ApprovalRequest {
+                                call_id: "push".to_string(),
+                                name: "bash".to_string(),
+                                summary: "git push origin main".to_string(),
+                                subagent_id: None,
+                                hunks: None,
+                                info: Default::default(),
+                            }],
+                            &mut input,
+                        );
+                    }
+                }
+                if matches!(state.activity.kind, ActivityKind::Output) {
+                    state.activity.last_delta_at = Some(now);
+                }
+                let shown = ((ms / state_ms) as usize).min(STATES.len() - 1);
+                frames.push(render(
+                    STATES[shown],
+                    theme_name,
+                    width,
+                    height,
+                    &mut state,
+                    &input,
+                    now,
+                ));
+            }
+        });
+    }
+    Value::Array(frames)
+}
+
 /// One moment of the working indicator (`at_ms` into the turn) under each
 /// fallback: truecolor dark and light, the 256 and 16 colour palettes,
 /// `NO_COLOR`, the legacy Windows console (no braille) and a still row

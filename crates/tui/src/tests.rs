@@ -1146,7 +1146,124 @@ fn working_row_follows_the_terminal_theme() {
         ..crate::theme::Theme::new(crate::theme::ColorDepth::None, None)
     };
     let text = crate::theme::with_theme(still, || row(&mut app));
-    assert!(text.starts_with("  ⡎⢺ 工作中 "), "{text}");
+    assert!(text.starts_with("  ⢎⡱ 工作中 "), "{text}");
+}
+
+#[test]
+fn glyph_motion_follows_what_the_turn_does() {
+    use crate::working_indicator::{Motion, ToolKind};
+    let now = Instant::now();
+    let mut activity = ActivityState::idle();
+    assert_eq!(activity.wanted_motion(now, false), None);
+    activity.turn_started_at = Some(now - Duration::from_secs(3));
+    activity.phase_started_at = Some(now - Duration::from_secs(1));
+    activity.last_delta_at = Some(now);
+    let cases = [
+        (ActivityKind::Connecting, ToolKind::Run, Motion::Ring),
+        (
+            ActivityKind::Reconnecting { attempt: 2 },
+            ToolKind::Run,
+            Motion::Ring,
+        ),
+        (ActivityKind::Thinking, ToolKind::Run, Motion::Sphere),
+        (ActivityKind::Output, ToolKind::Run, Motion::Stream),
+        (ActivityKind::Tool, ToolKind::Run, Motion::Orbit),
+        (ActivityKind::Tool, ToolKind::Read, Motion::Scan),
+        (ActivityKind::Tool, ToolKind::Edit, Motion::Typing),
+        (ActivityKind::Compacting, ToolKind::Run, Motion::Contract),
+    ];
+    for (kind, tool, motion) in cases {
+        activity.kind = kind;
+        activity.tool = tool;
+        assert_eq!(activity.wanted_motion(now, false), Some(motion));
+        // A confirmation waiting on the user: the dots breathe.
+        assert_eq!(activity.wanted_motion(now, true), Some(Motion::Breathe));
+    }
+    // A reply that stalled breathes too, under its own label.
+    activity.kind = ActivityKind::Output;
+    activity.last_delta_at = Some(now - Duration::from_secs(9));
+    assert_eq!(activity.wanted_motion(now, false), Some(Motion::Breathe));
+}
+
+#[test]
+fn tool_events_change_the_glyph_once_they_last() {
+    use crate::working_indicator::Motion;
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![AgentEvent::ThinkingStart]);
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let shown = |app: &TuiApp<TestRuntime>, ms: u64| {
+        app.state
+            .activity
+            .progress(at(ms))
+            .expect("a turn runs")
+            .motion
+            .motion
+    };
+    app.state.activity.refresh_motion(at(0), false);
+    assert_eq!(shown(&app, 0), Motion::Sphere);
+
+    app.apply_events(vec![AgentEvent::ToolStart {
+        call_id: "c1".to_string(),
+        name: "ripgrep".to_string(),
+    }]);
+    app.state.activity.refresh_motion(at(100), false);
+    assert_eq!(shown(&app, 450), Motion::Sphere);
+    app.state.activity.refresh_motion(at(500), false);
+    assert_eq!(shown(&app, 500), Motion::Scan);
+
+    // The result goes back to the model and the reply streams at once:
+    // the short connecting step never shows.
+    app.apply_events(vec![AgentEvent::ToolOutput {
+        call_id: "c1".to_string(),
+        name: "ripgrep".to_string(),
+        output: "{}".to_string(),
+        is_error: false,
+    }]);
+    app.state.activity.refresh_motion(at(600), false);
+    app.apply_events(vec![AgentEvent::AssistantDelta("ok".to_string())]);
+    app.state.activity.refresh_motion(at(800), false);
+    assert_eq!(shown(&app, 1_100), Motion::Scan);
+    assert_eq!(shown(&app, 1_200), Motion::Stream);
+
+    // The turn ends: no glyph.
+    app.apply_events(vec![AgentEvent::Status("ready".to_string())]);
+    app.state.activity.refresh_motion(at(1_300), false);
+    assert!(app.state.activity.progress(at(1_300)).is_none());
+}
+
+#[test]
+fn an_approval_makes_the_glyph_breathe() {
+    use crate::working_indicator::Motion;
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![
+        AgentEvent::ToolStart {
+            call_id: "c1".to_string(),
+            name: "bash".to_string(),
+        },
+        AgentEvent::ApprovalRequest {
+            call_id: "c1".to_string(),
+            name: "bash".to_string(),
+            summary: "rm -rf build".to_string(),
+            subagent_id: None,
+            hunks: None,
+            info: Default::default(),
+        },
+    ]);
+    let start = Instant::now();
+    app.state.activity.refresh_motion(start, false);
+    assert_eq!(
+        app.state.activity.progress(start).unwrap().motion.motion,
+        Motion::Orbit
+    );
+    // Building the frame sees the confirmation and asks for breathing.
+    app.build_document(80, start + Duration::from_millis(10));
+    let later = start + Duration::from_millis(600);
+    app.build_document(80, later);
+    assert_eq!(
+        app.state.activity.progress(later).unwrap().motion.motion,
+        Motion::Breathe
+    );
 }
 
 #[test]
