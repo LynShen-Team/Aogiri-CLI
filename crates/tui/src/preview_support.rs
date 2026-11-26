@@ -36,9 +36,112 @@ pub fn render_all() -> Value {
     for (theme_name, theme) in themes {
         theme::with_theme(theme, || {
             for (name, width, height, build) in scenes() {
-                let (state, input) = build();
-                frames.push(render(name, theme_name, width, height, state, input));
+                let (mut state, input) = build();
+                frames.push(render(
+                    name,
+                    theme_name,
+                    width,
+                    height,
+                    &mut state,
+                    &input,
+                    Instant::now(),
+                ));
             }
+        });
+    }
+    Value::Array(frames)
+}
+
+/// The working indicator over time: the bottom `height` rows of the
+/// working scene, `count` frames `step_ms` apart from `start_ms` into the
+/// turn, in the dark and light themes.
+pub fn render_indicator_frames(
+    start_ms: u64,
+    step_ms: u64,
+    count: u64,
+    width: u16,
+    height: u16,
+) -> Value {
+    let themes = [
+        (
+            "dark",
+            Theme::new(ColorDepth::TrueColor, Some((22, 21, 19))),
+        ),
+        (
+            "light",
+            Theme::new(ColorDepth::TrueColor, Some((251, 250, 247))),
+        ),
+    ];
+    let mut frames = Vec::new();
+    for (theme_name, theme) in themes {
+        theme::with_theme(theme, || {
+            let (mut state, input) = working();
+            let started = Instant::now();
+            state.activity.turn_started_at = Some(started);
+            state.activity.phase_started_at = Some(started);
+            for step in 0..count {
+                let now = started + Duration::from_millis(start_ms + step * step_ms);
+                frames.push(render(
+                    &format!("{}", start_ms + step * step_ms),
+                    theme_name,
+                    width,
+                    height,
+                    &mut state,
+                    &input,
+                    now,
+                ));
+            }
+        });
+    }
+    Value::Array(frames)
+}
+
+/// One moment of the working indicator (`at_ms` into the turn) under each
+/// fallback: truecolor dark and light, the 256 and 16 colour palettes,
+/// `NO_COLOR`, the legacy Windows console (no braille) and a still row
+/// (`TERM=dumb`, CI).
+pub fn render_indicator_variants(at_ms: u64, width: u16, height: u16) -> Value {
+    let dark = Some((22, 21, 19));
+    let variants = [
+        ("dark", Theme::new(ColorDepth::TrueColor, dark)),
+        (
+            "light",
+            Theme::new(ColorDepth::TrueColor, Some((251, 250, 247))),
+        ),
+        ("256", Theme::new(ColorDepth::Ansi256, dark)),
+        ("16", Theme::new(ColorDepth::Ansi16, dark)),
+        ("mono", Theme::new(ColorDepth::None, None)),
+        (
+            "console",
+            Theme {
+                rich_glyphs: false,
+                ..Theme::new(ColorDepth::TrueColor, None)
+            },
+        ),
+        (
+            "still",
+            Theme {
+                animate: false,
+                ..Theme::new(ColorDepth::TrueColor, dark)
+            },
+        ),
+    ];
+    let mut frames = Vec::new();
+    for (theme_name, theme) in variants {
+        theme::with_theme(theme, || {
+            let (mut state, input) = working();
+            let started = Instant::now();
+            state.activity.turn_started_at = Some(started);
+            state.activity.phase_started_at = Some(started);
+            frames.push(render(
+                "variant",
+                theme_name,
+                width,
+                height,
+                &mut state,
+                &input,
+                started + Duration::from_millis(at_ms),
+            ));
         });
     }
     Value::Array(frames)
@@ -64,11 +167,11 @@ fn render(
     theme_name: &str,
     width: u16,
     height: u16,
-    mut state: TuiState,
-    input: InputBuffer,
+    state: &mut TuiState,
+    input: &InputBuffer,
+    now: Instant,
 ) -> Value {
-    let now = Instant::now();
-    let document = state.build_document(&input, width as usize, now, None);
+    let document = state.build_document(input, width as usize, now, None);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
     let mut cursor = None;
     terminal
@@ -236,7 +339,6 @@ fn working() -> (TuiState, InputBuffer) {
     state.activity.kind = ActivityKind::Tool;
     state.activity.turn_started_at = Some(Instant::now() - Duration::from_secs(14));
     state.activity.phase_started_at = Some(Instant::now() - Duration::from_secs(2));
-    state.activity.estimated_output_tokens = 2_100;
     state.current_context_tokens = 72_000;
     (state, input)
 }

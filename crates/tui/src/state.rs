@@ -18,7 +18,6 @@ pub(super) struct TuiState {
     /// When the active reasoning block started streaming; collapsed blocks keep
     /// the elapsed time on their header.
     pub(super) reasoning_started: Option<Instant>,
-    pub(super) thinking_tokens: u64,
     pub(super) status: String,
     pub(super) provider: String,
     pub(super) model: String,
@@ -76,7 +75,6 @@ impl Default for TuiState {
             assistant_index: None,
             reasoning_index: None,
             reasoning_started: None,
-            thinking_tokens: 0,
             status: "ready".to_string(),
             provider: "unknown".to_string(),
             model: "unknown".to_string(),
@@ -153,7 +151,6 @@ impl TuiState {
             .pending_messages(&self.pending_messages, control_width)
             .progress(
                 &self.activity,
-                self.thinking_tokens,
                 self.awaiting_connection(),
                 now,
                 control_width,
@@ -525,8 +522,8 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
-                AgentEvent::CompactionProgress { output_tokens } => {
-                    self.activity.set_compaction_output_tokens(output_tokens);
+                AgentEvent::CompactionProgress { .. } => {
+                    self.activity.note_compaction_progress();
                     true
                 }
                 AgentEvent::CompactionEnd { .. } => {
@@ -580,7 +577,6 @@ impl TuiState {
                     // streamed output to avoid duplicating it on the retry.
                     self.discard_partial_assistant();
                     self.discard_partial_reasoning();
-                    self.thinking_tokens = 0;
                     self.activity.start_reconnecting(attempt);
                     true
                 }
@@ -591,7 +587,7 @@ impl TuiState {
                 }
                 AgentEvent::AssistantDelta(delta) => {
                     self.collapse_live_thinking();
-                    self.activity.add_output_delta(&delta);
+                    self.activity.add_output_delta();
                     self.append_assistant_delta(&delta);
                     true
                 }
@@ -645,16 +641,8 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
-                AgentEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                    reasoning_tokens,
-                    ..
-                } => {
-                    let _ = (input_tokens, output_tokens);
-                    self.record_reasoning_tokens(reasoning_tokens);
-                    true
-                }
+                // The working indicator shows no token counts.
+                AgentEvent::Usage { .. } => false,
                 AgentEvent::TreeView(nodes) => {
                     self.picker_view = Some(PickerState::checkout(nodes));
                     true
@@ -890,8 +878,6 @@ impl TuiState {
             // above-input status indicator is reset once the reply is done.
             self.collapse_live_thinking();
             changed |= self.commit_live_assistant();
-            changed |= self.thinking_tokens != 0;
-            self.thinking_tokens = 0;
             self.reasoning_index = None;
         }
         if status == "ready" || status == "interrupted" {
@@ -959,11 +945,10 @@ impl TuiState {
         }
     }
 
-    /// Forget the current reasoning message and clear the token indicator (next turn).
+    /// Forget the current reasoning message (next turn).
     pub(super) fn reset_thinking(&mut self) {
         self.reasoning_index = None;
         self.reasoning_started = None;
-        self.thinking_tokens = 0;
     }
 
     /// Reasoning finished: collapse its transcript message to the duration header.
@@ -1021,13 +1006,6 @@ impl TuiState {
         }
         self.mark_history_dirty();
         true
-    }
-
-    /// Record reasoning tokens from response usage for the active thinking status.
-    pub(super) fn record_reasoning_tokens(&mut self, reasoning_tokens: u64) {
-        if reasoning_tokens > 0 {
-            self.thinking_tokens = reasoning_tokens;
-        }
     }
 
     pub(super) fn upsert_tool(

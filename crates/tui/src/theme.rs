@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 use ratatui::style::{Color, Modifier, Style};
 
-type Rgb = (u8, u8, u8);
+pub(crate) type Rgb = (u8, u8, u8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColorDepth {
@@ -32,6 +32,8 @@ pub(crate) struct Theme {
     /// The terminal draws block elements and braille (false on the legacy
     /// Windows console, whose fonts lack them).
     pub(crate) rich_glyphs: bool,
+    /// The working indicator may move (`working_indicator::motion_allowed`).
+    pub(crate) animate: bool,
 }
 
 /// One role's colour on a dark and a light background, a mid tone for an
@@ -115,6 +117,7 @@ impl Theme {
             depth,
             background,
             rich_glyphs: true,
+            animate: true,
         }
     }
 
@@ -123,15 +126,27 @@ impl Theme {
     }
 
     fn resolve(&self, tone: &Tone) -> Option<Color> {
-        let rgb = match self.is_dark() {
+        self.color(self.tone_rgb(tone), tone.ansi)
+    }
+
+    fn tone_rgb(&self, tone: &Tone) -> Rgb {
+        match self.is_dark() {
             Some(true) => tone.dark,
             Some(false) => tone.light,
             None => tone.mid,
-        };
-        self.color(rgb, tone.ansi)
+        }
     }
 
-    fn color(&self, rgb: Rgb, ansi: Color) -> Option<Color> {
+    /// The accent and attention tones for this background, for blends.
+    pub(crate) fn accent_rgb(&self) -> Rgb {
+        self.tone_rgb(&ACCENT)
+    }
+    pub(crate) fn warn_rgb(&self) -> Rgb {
+        self.tone_rgb(&WARN)
+    }
+
+    /// `rgb` at this colour depth (`ansi` on 16 colours, none without colour).
+    pub(crate) fn color(&self, rgb: Rgb, ansi: Color) -> Option<Color> {
         match self.depth {
             ColorDepth::None => None,
             ColorDepth::Ansi16 => Some(ansi),
@@ -343,10 +358,15 @@ pub(crate) fn detect() -> Theme {
     };
     let rich_glyphs =
         !cfg!(windows) || var("WT_SESSION").is_some() || var("TERM_PROGRAM").is_some();
+    let animate = crate::working_indicator::motion_allowed(var, {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal()
+    });
     Theme {
         depth,
         background,
         rich_glyphs,
+        animate,
     }
 }
 
@@ -439,7 +459,7 @@ fn luminance(rgb: Rgb) -> f32 {
     0.299 * rgb.0 as f32 + 0.587 * rgb.1 as f32 + 0.114 * rgb.2 as f32
 }
 
-fn mix(from: Rgb, to: Rgb, amount: f32) -> Rgb {
+pub(crate) fn mix(from: Rgb, to: Rgb, amount: f32) -> Rgb {
     let channel = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
     (
         channel(from.0, to.0),

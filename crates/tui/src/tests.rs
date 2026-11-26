@@ -475,7 +475,7 @@ fn progress_renders_above_input() {
     let progress_index = document
         .controls
         .iter()
-        .position(|line| line.plain().contains("连接中"))
+        .position(|line| line.plain().contains("工作中"))
         .expect("progress line should render");
     let input_index = document
         .controls
@@ -512,7 +512,7 @@ fn sent_message_is_dim_until_the_request_connects() {
     assert!(!document
         .controls
         .iter()
-        .any(|line| line.plain().contains("连接中")));
+        .any(|line| line.plain().contains("工作中")));
 
     app.apply_events(vec![AgentEvent::ThinkingStart]);
     assert_eq!(user_line_color(&mut app, "hello"), None);
@@ -731,22 +731,45 @@ fn startup_text_column_lines_up_when_projected() {
 }
 
 #[test]
-fn progress_shows_phase_elapsed_and_tokens() {
+fn progress_reads_working_with_the_turn_elapsed() {
+    use crate::working_indicator::Phase;
     let now = Instant::now();
     let mut activity = ActivityState::idle();
-    activity.kind = ActivityKind::Connecting;
+    assert_eq!(activity.progress(now), None);
     activity.turn_started_at = Some(now - Duration::from_secs(75));
     activity.phase_started_at = Some(now - Duration::from_secs(2));
+    activity.last_delta_at = Some(now);
 
-    let progress = activity.progress(now, 0).unwrap();
-    assert_eq!(progress.phase, "连接中");
-    assert_eq!(progress.detail, "1 分 15 秒");
-    assert!(!progress.stalled);
+    for kind in [
+        ActivityKind::Connecting,
+        ActivityKind::Thinking,
+        ActivityKind::Output,
+        ActivityKind::Tool,
+    ] {
+        activity.kind = kind;
+        let progress = activity.progress(now).unwrap();
+        assert_eq!(progress.phase, Phase::Working);
+        assert_eq!(progress.elapsed, Duration::from_secs(75));
+    }
+    activity.kind = ActivityKind::Compacting;
+    assert_eq!(activity.progress(now).unwrap().phase, Phase::Compacting);
+    activity.kind = ActivityKind::Reconnecting { attempt: 2 };
+    assert_eq!(
+        activity.progress(now).unwrap().phase,
+        Phase::Reconnecting { attempt: 2 }
+    );
 
     activity.kind = ActivityKind::Thinking;
-    let progress = activity.progress(now, 2_400).unwrap();
-    assert_eq!(progress.phase, "思考中");
-    assert_eq!(progress.detail, "1 分 15 秒 · ↓ 2k tokens");
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.activity = activity;
+    let document = app.build_document(80, now);
+    let row = document
+        .controls
+        .iter()
+        .find(|line| line.plain().contains("工作中"))
+        .expect("the working row renders")
+        .plain();
+    assert!(row.ends_with("工作中 1 分 15 秒"), "{row}");
 }
 
 #[test]
@@ -834,7 +857,7 @@ fn thinking_header_click_toggles_reasoning_block() {
 }
 
 #[test]
-fn reasoning_tokens_show_in_thinking_progress_not_transcript() {
+fn usage_tokens_show_neither_in_progress_nor_transcript() {
     let mut app = TuiApp::new(TestRuntime::default());
     app.apply_events(vec![
         AgentEvent::ThinkingStart,
@@ -846,13 +869,12 @@ fn reasoning_tokens_show_in_thinking_progress_not_transcript() {
             reasoning_tokens: 88,
         },
     ]);
-    assert_eq!(app.state.thinking_tokens, 88);
     let document = app.build_document(80, Instant::now());
-    // Token count is in the progress line, not the transcript.
+    // The working row carries the label and the time, no token count.
     assert!(document
         .controls
         .iter()
-        .any(|line| line.plain().contains("思考中") && line.plain().contains("↓ 88 tokens")));
+        .any(|line| line.plain().contains("工作中") && !line.plain().contains("tokens")));
     assert!(!document
         .history
         .iter()
@@ -964,7 +986,7 @@ fn assistant_message_is_rendered_as_markdown() {
 }
 
 #[test]
-fn thinking_tokens_reset_after_reply_completes() {
+fn working_row_clears_after_reply_completes() {
     let mut app = TuiApp::new(TestRuntime::default());
     app.apply_events(vec![
         AgentEvent::ThinkingStart,
@@ -977,16 +999,19 @@ fn thinking_tokens_reset_after_reply_completes() {
             reasoning_tokens: 42,
         },
     ]);
-    assert_eq!(app.state.thinking_tokens, 42);
+    let document = app.build_document(80, Instant::now());
+    assert!(document
+        .controls
+        .iter()
+        .any(|line| line.plain().contains("工作中")));
 
     app.apply_events(vec![AgentEvent::Status("ready".to_string())]);
-    // Progress token state is cleared; the reasoning message itself stays in chat.
-    assert_eq!(app.state.thinking_tokens, 0);
+    // The working row is gone; the reasoning message itself stays in chat.
     let document = app.build_document(80, Instant::now());
     assert!(!document
         .controls
         .iter()
-        .any(|line| line.plain().contains("42 tokens")));
+        .any(|line| line.plain().contains("工作中")));
     assert!(reasoning_entry(&app).is_some());
 }
 
@@ -1048,7 +1073,12 @@ fn compaction_events_set_progress_notices_and_context_meter() {
         .any(|line| matches!(line, ChatLine::System(text) if text.contains("正在压缩"))));
 
     app.apply_events(vec![AgentEvent::CompactionProgress { output_tokens: 42 }]);
-    assert_eq!(app.state.activity.estimated_output_tokens, 42);
+    assert!(matches!(app.state.activity.kind, ActivityKind::Compacting));
+    let document = app.build_document(80, Instant::now());
+    assert!(document
+        .controls
+        .iter()
+        .any(|line| line.plain().contains("压缩上下文")));
 
     app.apply_events(vec![
         AgentEvent::CompactionEnd {
@@ -1071,40 +1101,21 @@ fn compaction_events_set_progress_notices_and_context_meter() {
 
 #[test]
 fn output_progress_reports_a_stall() {
+    use crate::working_indicator::Phase;
     let now = Instant::now();
     let mut activity = ActivityState::idle();
     activity.kind = ActivityKind::Output;
     activity.turn_started_at = Some(now - Duration::from_secs(20));
     activity.phase_started_at = Some(now - Duration::from_secs(20));
-    activity.estimated_output_tokens = 12;
 
     activity.last_delta_at = Some(now);
-    let fresh = activity.progress(now, 0).unwrap();
-    assert_eq!(fresh.phase, "输出中");
-    assert!(!fresh.stalled);
+    let fresh = activity.progress(now).unwrap();
+    assert_eq!(fresh.phase, Phase::Working);
 
     activity.last_delta_at = Some(now - Duration::from_secs(9));
-    let stalled = activity.progress(now, 0).unwrap();
-    assert_eq!(stalled.phase, "等待响应 9 秒");
-    assert!(stalled.stalled);
-}
-
-#[test]
-fn spinner_frames_are_single_cells() {
-    for tick in 0..24 {
-        assert_eq!(UnicodeWidthStr::width(spinner_char(tick)), 1);
-    }
-    crate::theme::with_theme(
-        crate::theme::Theme {
-            rich_glyphs: false,
-            ..crate::theme::Theme::new(crate::theme::ColorDepth::Ansi16, None)
-        },
-        || {
-            for tick in 0..8 {
-                assert!(spinner_char(tick).is_ascii());
-            }
-        },
-    );
+    let stalled = activity.progress(now).unwrap();
+    assert_eq!(stalled.phase, Phase::Waiting);
+    assert_eq!(stalled.elapsed, Duration::from_secs(20));
 }
 
 #[test]
