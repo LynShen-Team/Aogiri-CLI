@@ -12,9 +12,9 @@ use crate::picker::{PickerMode, PickerState, TreePromptAction};
 use crate::theme;
 use crate::tool_preview::{tool_view, BodyMode, ToolState};
 use crate::{
-    compact_home_path, format_context_window, spinner_char, truncate_line_spans,
-    truncate_line_to_width, truncate_to_width, AccountState, ActivityState, BottomStatus, ChatLine,
-    CommandCandidate, UiDocument, UiKind, UiLine,
+    compact_home_path, format_context_window, truncate_line_spans, truncate_line_to_width,
+    truncate_to_width, AccountState, ActivityState, BottomStatus, ChatLine, CommandCandidate,
+    UiDocument, UiKind, UiLine,
 };
 
 /// Picker rows rendered at once; longer lists window around the selection.
@@ -57,32 +57,6 @@ fn format_thinking_duration(secs: u64) -> String {
         (true, false) => format!("{secs} 秒"),
         (false, true) => format!("{}m {}s", secs / 60, secs % 60),
         (false, false) => format!("{secs}s"),
-    }
-}
-
-/// Elapsed turn time, compact: `12 秒`, `1 分 05 秒` (`12s`, `1m 05s`).
-pub(crate) fn format_turn_elapsed(secs: u64) -> String {
-    let zh = crate::lang::is_zh();
-    if secs < 60 {
-        return if zh {
-            format!("{secs} 秒")
-        } else {
-            format!("{secs}s")
-        };
-    }
-    let (minutes, seconds) = (secs / 60, secs % 60);
-    if minutes < 60 {
-        return if zh {
-            format!("{minutes} 分 {seconds:02} 秒")
-        } else {
-            format!("{minutes}m {seconds:02}s")
-        };
-    }
-    let (hours, minutes) = (minutes / 60, minutes % 60);
-    if zh {
-        format!("{hours} 时 {minutes:02} 分")
-    } else {
-        format!("{hours}h {minutes:02}m")
     }
 }
 
@@ -947,10 +921,10 @@ impl UiBuilder {
         self
     }
 
+    /// The working indicator while a turn runs (`working_indicator`).
     pub(crate) fn progress(
         mut self,
         activity: &ActivityState,
-        thinking_tokens: u64,
         awaiting_connection: bool,
         now: Instant,
         width: usize,
@@ -958,32 +932,11 @@ impl UiBuilder {
         if awaiting_connection && matches!(activity.kind, crate::ActivityKind::Connecting) {
             return self;
         }
-        let Some(progress) = activity.progress(now, thinking_tokens) else {
+        let Some(progress) = activity.progress(now) else {
             return self;
         };
-        let indicator = spinner_char(activity.animation_tick);
-        let spinner_style = if progress.stalled {
-            theme::warn()
-        } else {
-            theme::accent()
-        };
-        let mut spans = vec![
-            Span::raw("  "),
-            Span::styled(indicator, spinner_style),
-            Span::raw(" "),
-            Span::raw(progress.phase),
-        ];
-        if !progress.detail.is_empty() {
-            spans.push(Span::styled(format!("  {}", progress.detail), theme::dim()));
-        }
-        spans.push(Span::styled(
-            format!("  · {}", t("esc 中断", "esc to interrupt")),
-            theme::dim(),
-        ));
-        self.control_line(
-            UiKind::Status,
-            truncate_line_spans(&Line::from(spans), width),
-        );
+        let row = crate::working_indicator::line(&theme::current(), &progress);
+        self.control_line(UiKind::Status, truncate_line_spans(&row, width));
         self
     }
 

@@ -17,6 +17,7 @@ mod tests;
 mod theme;
 mod tool_preview;
 mod ui_builder;
+mod working_indicator;
 
 use git_bar::GitStatusTracker;
 use input::{paste_burst_render_delay, InputBuffer, PasteBurst, PasteCharDecision, PasteFlush};
@@ -47,7 +48,6 @@ use ui_builder::UiBuilder;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Output that brings nothing new for this long reads as stalled.
 const STALL_AFTER: Duration = Duration::from_secs(8);
 const PASTE_PLACEHOLDER_CHARS: usize = 200;
@@ -551,8 +551,6 @@ struct ActivityState {
     turn_started_at: Option<Instant>,
     phase_started_at: Option<Instant>,
     last_delta_at: Option<Instant>,
-    estimated_output_tokens: u64,
-    animation_tick: usize,
 }
 
 struct TerminalGuard;
@@ -634,7 +632,7 @@ impl<R: TuiRuntime> TuiApp<R> {
         );
         let now = Instant::now();
         let mut frames = FrameScheduler::new(now);
-        let mut next_progress_at = now + PROGRESS_INTERVAL;
+        let mut next_progress_at = now + working_indicator::redraw_interval(&theme::current());
         let mut turn_was_active = false;
 
         loop {
@@ -673,9 +671,9 @@ impl<R: TuiRuntime> TuiApp<R> {
                 account.refresh_if_stale(now);
             }
 
+            // The working indicator moves (or its seconds tick) while a turn runs.
             if self.state.activity.is_active() && now >= next_progress_at {
-                self.state.activity.advance_animation();
-                next_progress_at = now + PROGRESS_INTERVAL;
+                next_progress_at = now + working_indicator::redraw_interval(&theme::current());
                 frames.request_now(now);
             }
 
@@ -1504,8 +1502,6 @@ impl ActivityState {
             turn_started_at: None,
             phase_started_at: None,
             last_delta_at: None,
-            estimated_output_tokens: 0,
-            animation_tick: 0,
         }
     }
 
@@ -1513,7 +1509,6 @@ impl ActivityState {
         let now = Instant::now();
         if self.turn_started_at.is_none() {
             self.turn_started_at = Some(now);
-            self.estimated_output_tokens = 0;
             self.last_delta_at = None;
         }
         self.phase_started_at = Some(now);
@@ -1535,7 +1530,6 @@ impl ActivityState {
         let now = Instant::now();
         if self.turn_started_at.is_none() {
             self.turn_started_at = Some(now);
-            self.estimated_output_tokens = 0;
             self.last_delta_at = None;
         }
         if !matches!(self.kind, ActivityKind::Compacting) {
@@ -1544,11 +1538,10 @@ impl ActivityState {
         self.kind = ActivityKind::Compacting;
     }
 
-    fn set_compaction_output_tokens(&mut self, output_tokens: u64) {
+    fn note_compaction_progress(&mut self) {
         if !matches!(self.kind, ActivityKind::Compacting) {
             self.start_compacting();
         }
-        self.estimated_output_tokens = output_tokens;
         self.last_delta_at = Some(Instant::now());
     }
 
@@ -1570,13 +1563,12 @@ impl ActivityState {
         self.kind = ActivityKind::Tool;
     }
 
-    fn add_output_delta(&mut self, delta: &str) {
+    fn add_output_delta(&mut self) {
         let now = Instant::now();
         if !matches!(self.kind, ActivityKind::Output) {
             self.phase_started_at = Some(now);
         }
         self.last_delta_at = Some(now);
-        self.estimated_output_tokens += estimate_tokens(delta);
         self.kind = ActivityKind::Output;
     }
 
@@ -1585,69 +1577,40 @@ impl ActivityState {
         self.turn_started_at = None;
         self.phase_started_at = None;
         self.last_delta_at = None;
-        self.estimated_output_tokens = 0;
     }
 
     fn is_active(&self) -> bool {
         !matches!(self.kind, ActivityKind::Idle)
     }
 
-    fn advance_animation(&mut self) {
-        self.animation_tick = self.animation_tick.wrapping_add(1);
-    }
-
-    fn progress(&self, now: Instant, thinking_tokens: u64) -> Option<ProgressState> {
+    /// The working indicator's phase and the time since the turn started.
+    fn progress(&self, now: Instant) -> Option<working_indicator::Progress> {
+        use working_indicator::Phase;
         let turn_started_at = self.turn_started_at.or(self.phase_started_at)?;
         let phase_started_at = self.phase_started_at.unwrap_or(turn_started_at);
-        let elapsed = now.saturating_duration_since(turn_started_at);
-        let phase_elapsed = now.saturating_duration_since(phase_started_at);
-        let mut stalled = false;
         let phase = match self.kind {
             ActivityKind::Idle => return None,
-            ActivityKind::Connecting => lang::t("连接中", "Connecting").to_string(),
-            ActivityKind::Thinking => lang::t("思考中", "Thinking").to_string(),
-            ActivityKind::Compacting => lang::t("压缩上下文", "Compacting context").to_string(),
-            ActivityKind::Reconnecting { attempt } => match lang::lang() {
-                lang::Lang::Zh => format!("重连中（第 {attempt} 次）"),
-                lang::Lang::En => format!("Reconnecting (attempt {attempt})"),
-            },
+            ActivityKind::Connecting | ActivityKind::Thinking | ActivityKind::Tool => {
+                Phase::Working
+            }
+            ActivityKind::Compacting => Phase::Compacting,
+            ActivityKind::Reconnecting { attempt } => Phase::Reconnecting { attempt },
             ActivityKind::Output => {
                 // No new text for a while: the reply stalled upstream.
-                let quiet_for = self
-                    .last_delta_at
-                    .map(|last| now.saturating_duration_since(last))
-                    .unwrap_or(phase_elapsed);
+                let quiet_for =
+                    now.saturating_duration_since(self.last_delta_at.unwrap_or(phase_started_at));
                 if quiet_for >= STALL_AFTER {
-                    stalled = true;
-                    match lang::lang() {
-                        lang::Lang::Zh => format!("等待响应 {} 秒", quiet_for.as_secs()),
-                        lang::Lang::En => format!("Waiting for the reply {}s", quiet_for.as_secs()),
-                    }
+                    Phase::Waiting
                 } else {
-                    lang::t("输出中", "Writing").to_string()
+                    Phase::Working
                 }
             }
-            ActivityKind::Tool => lang::t("运行工具", "Running a tool").to_string(),
         };
-        let mut detail = ui_builder::format_turn_elapsed(elapsed.as_secs());
-        let tokens = self.estimated_output_tokens + thinking_tokens;
-        if tokens > 0 {
-            detail.push_str(&format!(" · ↓ {} tokens", format_token_count(tokens)));
-        }
-        Some(ProgressState {
+        Some(working_indicator::Progress {
             phase,
-            detail,
-            stalled,
+            elapsed: now.saturating_duration_since(turn_started_at),
         })
     }
-}
-
-/// What the progress row says: the phase, the elapsed time and tokens, and
-/// whether the reply stalled (the spinner turns to the attention colour).
-struct ProgressState {
-    phase: String,
-    detail: String,
-    stalled: bool,
 }
 
 /// Looks the LynShen account up off the UI thread: at startup, and again
@@ -1835,15 +1798,6 @@ pub(crate) fn extract_cursor(lines: &[UiLine]) -> Option<CursorTarget> {
     None
 }
 
-/// One frame of the progress spinner: braille dots, or an ASCII line where
-/// the terminal's font lacks braille.
-pub(crate) fn spinner_char(tick: usize) -> &'static str {
-    const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    const ASCII: &[&str] = &["-", "\\", "|", "/"];
-    let frames = if theme::rich_glyphs() { BRAILLE } else { ASCII };
-    frames[tick % frames.len()]
-}
-
 fn truncate_to_width(text: &str, max_width: usize) -> String {
     let mut output = String::new();
     let mut width = 0;
@@ -1919,24 +1873,6 @@ pub(crate) fn kind_style(kind: UiKind) -> Style {
         UiKind::Error => theme::err(),
         UiKind::DiffAdd => theme::add(),
         UiKind::DiffRemove => theme::del(),
-    }
-}
-
-fn estimate_tokens(text: &str) -> u64 {
-    if text.is_empty() {
-        return 0;
-    }
-    let chars = text.chars().count() as u64;
-    u64::max(1, chars.div_ceil(4))
-}
-
-fn format_token_count(value: u64) -> String {
-    if value >= 1_000_000 {
-        format!("{:.2}M", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{}k", value / 1_000)
-    } else {
-        value.to_string()
     }
 }
 

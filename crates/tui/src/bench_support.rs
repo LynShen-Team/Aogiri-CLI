@@ -76,12 +76,6 @@ fn build_document(rendered_history_lines: Vec<UiLine>, width: usize, tick: usize
             },
             width,
         )
-        .progress(
-            &crate::ActivityState::idle(),
-            0,
-            false,
-            Instant::now(),
-            width,
-        )
+        .progress(&crate::ActivityState::idle(), false, Instant::now(), width)
         .finish()
 }

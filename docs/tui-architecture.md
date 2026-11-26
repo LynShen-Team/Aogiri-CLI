@@ -237,7 +237,7 @@ This is effectively a manual view-composition pipeline.
 - tool output blocks and compact previews
 - command completion candidates
 - picker rows with selection highlighting
-- progress line with colored spinner
+- the working indicator (dot glyph, label, elapsed time)
 - bottom status line with model and token/context info
 
 The builder is intentionally string-first. It produces styled text lines, not nested widgets.
@@ -323,7 +323,7 @@ The renderer only paints the visible window (one screen of lines) into the frame
 This keeps per-frame terminal I/O small and the interface smooth during:
 
 - streamed output
-- spinner animation
+- the working indicator's animation
 - input editing
 - scrolling the transcript
 
@@ -361,7 +361,13 @@ Because the alternate screen has no native scrollback, the transcript is browsed
 - `Output`
 - `Tool`
 
-It stores timing and token estimates, and `progress()` maps that into a `ProgressState` used by the bottom progress line.
+It stores the turn and phase timing, and `progress()` maps that into a `working_indicator::Progress` (a phase and the time since the turn started) for the row above the composer.
+
+### Working indicator
+
+`working_indicator.rs` draws that row: `⢎⡱ 工作中 41 秒` (`Working 41s`). The glyph is two braille cells (a 4×4 dot grid): a sphere of eleven dots turning on a tilted axis that, every 9 seconds, gathers into the LynShen mark (the welcome logo's two trunks and the light between them, `⡎⢺`) for about a second and scatters back; dots further back are drawn closer to the background colour. A soft light crosses the label in 1.6 s, then rests 0.6 s. The time reads `41 秒`, `1 分 05 秒`, `1 时 02 分`. Compacting, reconnecting and a stalled reply (`等待响应`, in the attention tone) replace the label; token counts are not shown.
+
+Every frame is a pure function of the time since the turn started, redrawn about 12 times a second (`FRAME_INTERVAL`). Fallbacks follow `Theme`: the light is a colour blend in truecolor and the 256 greys, bold on 16 colours and absent without colour (`NO_COLOR`: the dots still turn); the legacy Windows console (`rich_glyphs` false) gets the ASCII spinner; without motion (`TERM=dumb`, `CI`, stdout not a terminal: `Theme::animate`) the row is still (the mark, the plain label, the seconds) and redrawn twice a second. The row disappears when the turn ends or is interrupted; nothing is left behind on the screen.
 
 This is a nice separation: the app tracks semantic activity, and the UI layer only asks for a renderable progress view.
 
