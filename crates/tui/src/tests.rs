@@ -1119,6 +1119,37 @@ fn output_progress_reports_a_stall() {
 }
 
 #[test]
+fn working_row_follows_the_terminal_theme() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![AgentEvent::ThinkingStart]);
+    let row = |app: &mut TuiApp<TestRuntime>| {
+        let document = app.build_document(80, Instant::now());
+        document
+            .controls
+            .iter()
+            .find(|line| line.plain().contains("工作中"))
+            .expect("the working row renders")
+            .plain()
+    };
+    // Braille dots by default; the ASCII spinner where the console font
+    // lacks braille; the still mark without motion.
+    let text = row(&mut app);
+    assert!(!text[..text.find("工作中").unwrap()].is_ascii(), "{text}");
+    let console = crate::theme::Theme {
+        rich_glyphs: false,
+        ..crate::theme::Theme::new(crate::theme::ColorDepth::TrueColor, None)
+    };
+    let text = crate::theme::with_theme(console, || row(&mut app));
+    assert!(text[..text.find("工作中").unwrap()].is_ascii(), "{text}");
+    let still = crate::theme::Theme {
+        animate: false,
+        ..crate::theme::Theme::new(crate::theme::ColorDepth::None, None)
+    };
+    let text = crate::theme::with_theme(still, || row(&mut app));
+    assert!(text.starts_with("  ⡎⢺ 工作中 "), "{text}");
+}
+
+#[test]
 fn long_generic_output_folds_until_expanded() {
     let output = (0..20)
         .map(|index| format!("line {index}"))
