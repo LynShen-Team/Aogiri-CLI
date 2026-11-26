@@ -2712,7 +2712,14 @@ fn a_custom_provider_gets_its_key_alone_and_its_turns_stay_off_the_gateway_ledge
     );
     let session = created["session"].as_str().unwrap().to_string();
     desktop.send(json!({ "op": "watch", "session": session }));
-    let frames = desktop.until(is_ready(&session));
+    let mut frames = desktop.until(is_ready(&session));
+    // The engine's own first `ready` can arrive before the watch snapshot,
+    // which carries `tool_provider`: wait for that too.
+    if !frames.iter().any(|f| f["type"] == "tool_provider") {
+        frames.extend(
+            desktop.until(|f| f["session"] == session.as_str() && f["type"] == "tool_provider"),
+        );
+    }
     let provider = frames
         .iter()
         .rev()

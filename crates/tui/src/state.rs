@@ -145,6 +145,9 @@ impl TuiState {
             ))
         };
         let balance = self.account.balance();
+        // The working indicator's glyph follows what the turn does; it
+        // breathes while a confirmation waits on the user.
+        self.activity.refresh_motion(now, confirming);
         let mut builder = UiBuilder::new()
             .rendered_history_lines(rendered_history_lines)
             .picker(self.picker_view.as_ref(), control_width)

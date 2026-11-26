@@ -551,6 +551,10 @@ struct ActivityState {
     turn_started_at: Option<Instant>,
     phase_started_at: Option<Instant>,
     last_delta_at: Option<Instant>,
+    /// What the running tool does (the glyph's motion while `Tool`).
+    tool: working_indicator::ToolKind,
+    /// The glyph's motion over this turn (`refresh_motion`).
+    motion: Option<working_indicator::MotionTrack>,
 }
 
 struct TerminalGuard;
@@ -1502,6 +1506,8 @@ impl ActivityState {
             turn_started_at: None,
             phase_started_at: None,
             last_delta_at: None,
+            tool: working_indicator::ToolKind::Run,
+            motion: None,
         }
     }
 
@@ -1554,7 +1560,8 @@ impl ActivityState {
         self.kind = ActivityKind::Reconnecting { attempt };
     }
 
-    fn start_tool(&mut self, _name: String) {
+    fn start_tool(&mut self, name: String) {
+        self.tool = working_indicator::tool_kind(&name);
         let now = Instant::now();
         if self.turn_started_at.is_none() {
             self.turn_started_at = Some(now);
@@ -1577,38 +1584,85 @@ impl ActivityState {
         self.turn_started_at = None;
         self.phase_started_at = None;
         self.last_delta_at = None;
+        self.motion = None;
     }
 
     fn is_active(&self) -> bool {
         !matches!(self.kind, ActivityKind::Idle)
     }
 
-    /// The working indicator's phase and the time since the turn started.
+    /// No new text for a while while writing: the reply stalled upstream.
+    fn stalled(&self, now: Instant) -> bool {
+        if !matches!(self.kind, ActivityKind::Output) {
+            return false;
+        }
+        let Some(since) = self.last_delta_at.or(self.phase_started_at) else {
+            return false;
+        };
+        now.saturating_duration_since(since) >= STALL_AFTER
+    }
+
+    /// The glyph's motion for what the turn does now; `awaiting_user` while
+    /// an approval (or another confirmation) waits on the user.
+    fn wanted_motion(
+        &self,
+        now: Instant,
+        awaiting_user: bool,
+    ) -> Option<working_indicator::Motion> {
+        use working_indicator::{Motion, ToolKind};
+        if !self.is_active() {
+            return None;
+        }
+        if awaiting_user || self.stalled(now) {
+            return Some(Motion::Breathe);
+        }
+        Some(match self.kind {
+            ActivityKind::Idle | ActivityKind::Thinking => Motion::Sphere,
+            ActivityKind::Connecting | ActivityKind::Reconnecting { .. } => Motion::Ring,
+            ActivityKind::Compacting => Motion::Contract,
+            ActivityKind::Output => Motion::Stream,
+            ActivityKind::Tool => match self.tool {
+                ToolKind::Run => Motion::Orbit,
+                ToolKind::Read => Motion::Scan,
+                ToolKind::Edit => Motion::Typing,
+            },
+        })
+    }
+
+    /// Asks for the motion the turn wants now; the track debounces it.
+    /// Called with each frame.
+    fn refresh_motion(&mut self, now: Instant, awaiting_user: bool) {
+        let Some(motion) = self.wanted_motion(now, awaiting_user) else {
+            self.motion = None;
+            return;
+        };
+        match &mut self.motion {
+            Some(track) => track.request(motion, now),
+            None => self.motion = Some(working_indicator::MotionTrack::new(motion, now)),
+        }
+    }
+
+    /// The working indicator: its label, the time since the turn started
+    /// and the glyph's motion.
     fn progress(&self, now: Instant) -> Option<working_indicator::Progress> {
-        use working_indicator::Phase;
+        use working_indicator::{MotionView, Phase};
         let turn_started_at = self.turn_started_at.or(self.phase_started_at)?;
-        let phase_started_at = self.phase_started_at.unwrap_or(turn_started_at);
         let phase = match self.kind {
             ActivityKind::Idle => return None,
-            ActivityKind::Connecting | ActivityKind::Thinking | ActivityKind::Tool => {
-                Phase::Working
-            }
             ActivityKind::Compacting => Phase::Compacting,
             ActivityKind::Reconnecting { attempt } => Phase::Reconnecting { attempt },
-            ActivityKind::Output => {
-                // No new text for a while: the reply stalled upstream.
-                let quiet_for =
-                    now.saturating_duration_since(self.last_delta_at.unwrap_or(phase_started_at));
-                if quiet_for >= STALL_AFTER {
-                    Phase::Waiting
-                } else {
-                    Phase::Working
-                }
-            }
+            _ if self.stalled(now) => Phase::Waiting,
+            _ => Phase::Working,
+        };
+        let elapsed = now.saturating_duration_since(turn_started_at);
+        let motion = match &self.motion {
+            Some(track) => track.view(now),
+            None => MotionView::steady(self.wanted_motion(now, false)?, elapsed.as_millis() as u64),
         };
         Some(working_indicator::Progress {
             phase,
-            elapsed: now.saturating_duration_since(turn_started_at),
+            elapsed,
+            motion,
         })
     }
 }
