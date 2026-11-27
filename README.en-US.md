@@ -200,4 +200,4 @@ The full test suite on Linux needs `ripgrep`, `bubblewrap`, and unprivileged use
 
 ## License
 
-Code is licensed under the [Apache License 2.0](LICENSE); see also [NOTICE](NOTICE). `crates/llm-provider-kit` contains code and data from [oh-my-pi](https://github.com/can1357/oh-my-pi) under the MIT license; see [its NOTICE](https://github.com/Libra1337/llm-provider-kit/blob/main/NOTICE). The LynShen name and logo trademarks belong to LynShen Innovations INC. Third-party agents and tools belong to their respective owners.
+Code is licensed under the [Apache License 2.0](LICENSE); see also [NOTICE](NOTICE). `crates/llm-provider-kit` contains code and data from [oh-my-pi](https://github.com/can1357/oh-my-pi) under the MIT license; see [its NOTICE](https://github.com/HiCrislynn/llm-provider-kit/blob/main/NOTICE). The LynShen name and logo trademarks belong to LynShen Innovations INC. Third-party agents and tools belong to their respective owners.
