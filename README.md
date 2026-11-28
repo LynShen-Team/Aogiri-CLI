@@ -202,4 +202,4 @@ cargo test --workspace
 
 ## 许可证
 
-代码采用 [Apache License 2.0](LICENSE)，另见 [NOTICE](NOTICE)。`crates/llm-provider-kit` 包含来自 [oh-my-pi](https://github.com/can1357/oh-my-pi) 的代码和数据，使用 MIT 许可证，见[它的 NOTICE](https://github.com/Libra1337/llm-provider-kit/blob/main/NOTICE)。LynShen 名称和图标的商标权归 LynShen Innovations INC. 所有；第三方智能体及工具归各自所有者所有。
+代码采用 [Apache License 2.0](LICENSE)，另见 [NOTICE](NOTICE)。`crates/llm-provider-kit` 包含来自 [oh-my-pi](https://github.com/can1357/oh-my-pi) 的代码和数据，使用 MIT 许可证，见[它的 NOTICE](https://github.com/HiCrislynn/llm-provider-kit/blob/main/NOTICE)。LynShen 名称和图标的商标权归 LynShen Innovations INC. 所有；第三方智能体及工具归各自所有者所有。
